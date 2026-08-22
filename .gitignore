@@ -1,0 +1,10 @@
+# per-machine remembered settings (last used paths / tool / threads)
+# contain personal file paths - never commit
+dictcrack-gui.cfg
+dictcrack-gui.cfg.testbak
+
+# crack result outputs
+*_password.txt
+
+# temp files
+*.tmp
