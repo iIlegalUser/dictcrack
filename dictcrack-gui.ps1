@@ -14,13 +14,20 @@ param(
     [string]$Arch,
     [string]$Dict,
     [string]$Tool,
-    [int]$Threads = 0     # 0 = auto (half the logical cores, max 12)
+    # 0 = auto (half the logical cores, max 12); manual values are capped
+    # at 32 - each thread is a full PowerShell runspace instance
+    [ValidateRange(0, 32)]
+    [int]$Threads = 0
 )
 
 $ErrorActionPreference = 'Stop'
 
 # config file that remembers the last used archive / dictionary
 $cfgFile = Join-Path $PSScriptRoot 'dictcrack-gui.cfg'
+
+# result files are written next to this script, never into the folder
+# that happens to hold the archive
+$scriptDir = $PSScriptRoot
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -63,8 +70,12 @@ $cores = [Environment]::ProcessorCount
 function Get-AutoWorkerCount { [Math]::Min(12, [Math]::Max(1, [int][Math]::Round($cores / 2.0))) }
 $script:workerCount = Get-AutoWorkerCount
 
-# ---- helpers shared by both worker bodies (injected via string) ------
-$fnHelpers = @'
+# ---- helpers injected into the background runspaces via string --------
+# $fnProc: child-process plumbing - needed by every password test
+# $fnFind: tool detection - needed by the orchestrator; the UI thread
+#          dot-sources the SAME block for its dropdown, so the probe
+#          order exists only once (no duplicate to keep in sync)
+$fnProc = @'
     function Invoke-ToolTest([string]$exe, [string]$argsLine) {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $exe
@@ -76,8 +87,14 @@ $fnHelpers = @'
         $psi.RedirectStandardInput = $true
         $p = [System.Diagnostics.Process]::Start($psi)
         $p.StandardInput.Close()
-        [void]$p.StandardOutput.ReadToEnd()
-        [void]$p.StandardError.ReadToEnd()
+        # both pipes are drained concurrently: sequential ReadToEnd can
+        # deadlock when the child fills one pipe while we still block on
+        # the other (possible on the large output of a SUCCESSFUL t run -
+        # the one moment this must never hang)
+        $so = $p.StandardOutput.ReadToEndAsync()
+        $se = $p.StandardError.ReadToEndAsync()
+        [void]$so.Result
+        [void]$se.Result
         $p.WaitForExit()
         return $p.ExitCode
     }
@@ -92,6 +109,8 @@ $fnHelpers = @'
         # stdin is closed -> a password prompt fails immediately instead of hanging
         return Invoke-ToolTest $exe ("t -y $q$archive$q")
     }
+'@
+$fnFind = @'
     function Find-Tool([string]$dir, [string]$exe) {
         $list = @()
         foreach ($base in @($env:ProgramFiles, $env:ProgramW6432, ${env:ProgramFiles(x86)})) {
@@ -103,6 +122,7 @@ $fnHelpers = @'
         return $null
     }
 '@
+. ([scriptblock]::Create($fnFind))
 
 # ---- orchestrator: tool detect + encoding passes + parallel slices ---
 # runs in ONE background runspace (started from the Click handler). It
@@ -110,7 +130,7 @@ $fnHelpers = @'
 # publishes progress into $sync under a lock; the UI timer only READS
 # $sync (also under the lock).
 $orchestrator = [scriptblock]::Create(@'
-    param($sync, $passWorkerBlock, $workerCount)
+    param($sync, $passWorkerBlock, $workerCount, $scriptDir)
     # all writes to the shared $sync table go through these helpers: the
     # UI timer reads the table under the same lock - the standard way to
     # share one hashtable between the GUI thread and this worker thread
@@ -124,7 +144,7 @@ $orchestrator = [scriptblock]::Create(@'
             foreach ($k in $updates.Keys) { $sync[$k] = $updates[$k] }
         } finally { [System.Threading.Monitor]::Exit($sync.SyncRoot) }
     }
-'@ + $fnHelpers + @'
+'@ + $fnProc + $fnFind + @'
     try {
         if (-not (Get-Sync 'cancel')) {
             $arch = $sync.arch
@@ -168,10 +188,37 @@ $orchestrator = [scriptblock]::Create(@'
             } elseif ($b0 -eq 0xFE -and $b1 -eq 0xFF) {
                 throw '字典是 UTF-16BE 编码，请另存为 UTF-8 或 ANSI 后重试。'
             } else {
+                # no BOM: strict-decode the first 256 KB as UTF-8. Real
+                # UTF-8 (incl. pure ASCII) passes; GBK text almost always
+                # hits an illegal sequence, so the futile UTF-8 pass over
+                # a GBK dictionary is skipped entirely and ANSI runs alone.
+                # A GBK file that happens to be valid UTF-8 keeps both
+                # passes - the probe can only save time, never skip a hit.
                 $encodings = @(
                     @{ n = 'UTF-8'; k = 'utf8'; e = [Text.Encoding]::UTF8 },
                     @{ n = 'ANSI(系统默认)'; k = 'ansi'; e = [Text.Encoding]::Default }
                 )
+                $fs = [System.IO.File]::OpenRead($dict)
+                $fileLen = $fs.Length
+                $probeLen = [int][Math]::Min(262144, $fileLen)
+                $buf = New-Object byte[] $probeLen
+                [void]$fs.Read($buf, 0, $probeLen)
+                $fs.Close()
+                if ($probeLen -lt $fileLen) {
+                    # the probe may end mid multi-byte sequence: trim the
+                    # trailing non-ASCII bytes so the cut itself cannot
+                    # fake an illegal sequence
+                    $valid = $probeLen
+                    while ($valid -gt 0 -and $buf[$valid - 1] -ge 0x80) { $valid-- }
+                    if ($valid -ne $probeLen) {
+                        $buf2 = New-Object byte[] $valid
+                        [Array]::Copy($buf, $buf2, $valid)
+                        $buf = $buf2
+                    }
+                }
+                $strict = New-Object System.Text.UTF8Encoding($false, $true)
+                try { [void]$strict.GetString($buf) }
+                catch { $encodings = @(@{ n = 'ANSI(系统默认)'; k = 'ansi'; e = [Text.Encoding]::Default }) }
             }
 
             Set-Sync @{ passTot = $encodings.Count }
@@ -240,7 +287,9 @@ $orchestrator = [scriptblock]::Create(@'
                 }
                 Set-Sync @{ triedAll = ($sync.triedAll + $tried); current = '' }
 
-                if ($found -and -not (Get-Sync 'cancel')) {
+                if ($found) {
+                    # record the hit even when the user cancelled inside
+                    # the poll gap - a confirmed password is always real
                     Set-Sync @{ found = $found; foundEnc = $enc.k }
                     break
                 }
@@ -249,10 +298,8 @@ $orchestrator = [scriptblock]::Create(@'
             }
         }
 
-        if ((Get-Sync 'found') -and -not (Get-Sync 'cancel')) {
-            $dir = [System.IO.Path]::GetDirectoryName($arch)
-            if (-not $dir) { $dir = (Get-Location).Path }
-            $out = Join-Path $dir (([System.IO.Path]::GetFileNameWithoutExtension($arch)) + '_password.txt')
+        if (Get-Sync 'found') {
+            $out = Join-Path $scriptDir (([System.IO.Path]::GetFileNameWithoutExtension($arch)) + '_password.txt')
             [System.IO.File]::WriteAllText($out, $sync.found + "`r`n", [Text.Encoding]::Default)
             Set-Sync @{ outfile = $out }
         }
@@ -268,7 +315,7 @@ $orchestrator = [scriptblock]::Create(@'
 # no two threads ever write the same table
 $passWorker = [scriptblock]::Create(@'
     param($state, $tool, $arch, $passwords)
-'@ + $fnHelpers + @'
+'@ + $fnProc + @'
     try {
         foreach ($p in $passwords) {
             if ($state.cancel) { break }
@@ -284,18 +331,6 @@ $passWorker = [scriptblock]::Create(@'
     }
     $state.done = $true
 '@)
-
-# ---------------- tool detection for the GUI dropdown -----------------
-function Find-ToolMain([string]$dir, [string]$exe) {
-    $list = @()
-    foreach ($base in @($env:ProgramFiles, $env:ProgramW6432, ${env:ProgramFiles(x86)})) {
-        if ($base) { $list += (Join-Path $base (Join-Path $dir $exe)) }
-    }
-    foreach ($p in $list) { if (Test-Path $p) { return $p } }
-    $cmd = Get-Command $exe -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    return $null
-}
 
 # move the found password to line 1 of the dictionary file,
 # preserving the encoding (incl. BOM) that the password matched under
@@ -475,9 +510,9 @@ $cmbThreads.SelectedIndex = 0
 $toolPaths = New-Object System.Collections.ArrayList
 [void]$cmbTool.Items.Add('自动检测（按压缩包类型选择）')
 [void]$toolPaths.Add('')
-$detRar   = Find-ToolMain 'WinRAR' 'rar.exe'
-$detUnrar = Find-ToolMain 'WinRAR' 'unrar.exe'
-$detSz    = Find-ToolMain '7-Zip'  '7z.exe'
+$detRar   = Find-Tool 'WinRAR' 'rar.exe'
+$detUnrar = Find-Tool 'WinRAR' 'unrar.exe'
+$detSz    = Find-Tool '7-Zip'  '7z.exe'
 if ($detRar)   { [void]$cmbTool.Items.Add("WinRAR  rar.exe ($detRar)");     [void]$toolPaths.Add($detRar) }
 if ($detUnrar) { [void]$cmbTool.Items.Add("WinRAR  unrar.exe ($detUnrar)"); [void]$toolPaths.Add($detUnrar) }
 if ($detSz)    { [void]$cmbTool.Items.Add("7-Zip  7z.exe ($detSz)");        [void]$toolPaths.Add($detSz) }
@@ -602,13 +637,12 @@ $form.KeyPreview = $true
 $form.Add_KeyDown({
     if ($_.KeyCode -eq 'Escape') {
         $_.SuppressKeyPress = $true
-        if ($sync.running) {
-            [System.Threading.Monitor]::Enter($sync.SyncRoot)
-            try { $sync.cancel = $true } finally { [System.Threading.Monitor]::Exit($sync.SyncRoot) }
-            Set-Status '正在停止（等待当前测试结束）...' $cOrange
-        }
+        Request-Cancel
     }
 })
+# closing the window mid-run must tell the orchestrator to stop instead
+# of letting process exit hard-kill the runspaces and orphan 7z children
+$form.Add_FormClosing({ Request-Cancel })
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 150
@@ -617,6 +651,14 @@ $timer.Interval = 150
 function Set-Status([string]$text, $color) {
     $lblStatus.Text = $text
     $lblStatus.ForeColor = $color
+}
+
+# single cancellation path for Esc, the stop button and window close
+function Request-Cancel {
+    if (-not $sync.running) { return }
+    [System.Threading.Monitor]::Enter($sync.SyncRoot)
+    try { $sync.cancel = $true } finally { [System.Threading.Monitor]::Exit($sync.SyncRoot) }
+    Set-Status '正在停止（等待当前测试结束）...' $cOrange
 }
 
 $btnArch.Add_Click({
@@ -746,17 +788,12 @@ $btnStart.Add_Click({
     $script:rate = 0
 
     $script:orchPs = [powershell]::Create().AddScript($orchestrator.ToString()).
-        AddArgument($sync).AddArgument($passWorker).AddArgument($script:workerCount)
+        AddArgument($sync).AddArgument($passWorker).AddArgument($script:workerCount).AddArgument($scriptDir)
     $script:orchHandle = $script:orchPs.BeginInvoke()
     $timer.Start()
 })
 
-$btnStop.Add_Click({
-    if (-not $sync.running) { return }
-    [System.Threading.Monitor]::Enter($sync.SyncRoot)
-    try { $sync.cancel = $true } finally { [System.Threading.Monitor]::Exit($sync.SyncRoot) }
-    Set-Status '正在停止（等待当前测试结束）...' $cOrange
-})
+$btnStop.Add_Click({ Request-Cancel })
 
 $btnCopy.Add_Click({
     if ($txtPwd.Text) { Set-Clipboard -Value $txtPwd.Text }
@@ -785,6 +822,7 @@ function Format-Eta([double]$sec) {
 # ---- run finish (UI side; the orchestrator writes the result file) ---
 function Finish-Run {
     $timer.Stop()
+    $lblCurrent.Text = ''
     $btnStart.Enabled = $true
     $btnStop.Enabled = $false
     try {
@@ -799,7 +837,9 @@ function Finish-Run {
     if ($sync.found) {
         $txtPwd.Text = $sync.found
         $btnCopy.Enabled = $true
-        if (-not $sync.cancel) { $btnMove.Enabled = $true }
+        # a found password is valid even when the user cancelled during
+        # the run - moving it to the top of the dictionary stays useful
+        $btnMove.Enabled = $true
         $txtPwd.BackColor = $cGreenBg
         $txtPwd.ForeColor = $cGreenDk
         $grp.Text = '破解结果 — 已找到密码'
@@ -835,6 +875,7 @@ $timer.Add_Tick({
             tried = $sync.tried; triedAll = $sync.triedAll; total = $sync.total
             passN = $sync.passN; passTot = $sync.passTot; passName = $sync.passName
             nWorkers = $sync.nWorkers; current = $sync.current; done = $sync.done
+            phase = $sync.phase
         }
     } finally { [System.Threading.Monitor]::Exit($sync.SyncRoot) }
 
@@ -863,6 +904,11 @@ $timer.Add_Tick({
     if ($snap.passN -gt 0) {
         $lblStatus.Text = ('第 {0}/{1} 遍 ({2}){3}   已尝试 {4} / {5}' -f `
             $snap.passN, $snap.passTot, $snap.passName, $threads, $snap.tried, $snap.total)
+        $lblStatus.ForeColor = $cText
+    } elseif ($snap.phase -eq 'prep') {
+        # tool detection / BOM probe / reading a large dictionary can take
+        # a moment - say so instead of sticking at "starting..."
+        $lblStatus.Text = '正在准备（检测工具 / 读取字典）...'
         $lblStatus.ForeColor = $cText
     }
     if ($snap.current) { $lblCurrent.Text = '当前尝试: ' + $snap.current }
@@ -897,10 +943,10 @@ if (Test-Path $cfgFile) {
             if ($idx -lt 1) { continue }
             $k = $line.Substring(0, $idx).Trim()
             $v = $line.Substring($idx + 1)
-            if ($k -eq 'arch' -and -not $Arch) { $txtArch.Text = $v }
-            elseif ($k -eq 'dict' -and -not $Dict) { $txtDict.Text = $v }
+            if ($k -eq 'arch') { $txtArch.Text = $v }
+            elseif ($k -eq 'dict') { $txtDict.Text = $v }
             elseif ($k -eq 'tool' -and -not $Tool) { $rememberTool = $v }
-            elseif ($k -eq 'threads' -and -not $Threads) { $rememberThreads = [int]$v }
+            elseif ($k -eq 'threads') { $rememberThreads = [int]$v }
         }
         if ($rememberTool -and (Test-Path $rememberTool)) { Select-ToolPath $rememberTool }
     } catch { }
@@ -911,6 +957,8 @@ if ($Tool -and (Test-Path $Tool)) { Select-ToolPath $Tool }
 $initThreads = 0
 if ($Threads -gt 0) { $initThreads = $Threads }
 elseif ($rememberThreads -gt 0) { $initThreads = $rememberThreads }
+# the cfg is plain text and can be hand-edited - clamp like the parameter
+if ($initThreads -gt 32) { $initThreads = 32 }
 if ($initThreads -gt 0) {
     $i = $threadValues.IndexOf($initThreads)
     if ($i -ge 0) { $cmbThreads.SelectedIndex = $i }
@@ -921,7 +969,13 @@ if ($initThreads -gt 0) {
     }
 }
 if ($Arch -and $Dict) {
-    $form.Add_Shown({ if ((Test-Path $Arch) -and (Test-Path $Dict)) { $btnStart.PerformClick() } })
+    # unlike a manual click, auto-start suppresses the path MessageBox -
+    # surface an invalid command-line path in the status line instead of
+    # failing silently
+    $form.Add_Shown({
+        if ((Test-Path $Arch) -and (Test-Path $Dict)) { $btnStart.PerformClick() }
+        else { Set-Status '命令行指定的压缩包或字典文件不存在，请重新选择。' $cOrange }
+    })
 }
 [void]$form.ShowDialog()
 $form.Dispose()

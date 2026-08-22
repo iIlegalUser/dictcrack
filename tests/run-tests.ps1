@@ -16,6 +16,11 @@
 #      dictionary (both encoding passes must finish, no result file)
 #    - test 3: same as test 1 but with an explicit -Threads 4
 #      (thread selection flag must be accepted)
+#    - tests 4-6: dictionary encoding matrix (UTF-8 BOM / UTF-16LE /
+#      ANSI-GBK) with Chinese passwords - each encoding must crack;
+#      test 6 also covers the strict UTF-8 probe skip
+#    - test 7: Move-PasswordToTop extracted from the GUI file via AST
+#      (moves to line 1, de-duplicates, keeps the BOM)
 #
 #  IMPORTANT: every GUI launch passes an explicit -Tool so a tool
 #  remembered in dictcrack-gui.cfg can never intercept the .7z test
@@ -76,15 +81,16 @@ try {
         return $a
     }
 
-    function Start-Gui([string]$arch, [int]$threads) {
+    function Start-Gui([string]$arch, [int]$threads, [string]$dictPath) {
+        if (-not $dictPath) { $dictPath = $script:dict }
         $args = @('-STA', '-ExecutionPolicy', 'Bypass', '-File', $script:gui,
-                  '-Arch', $arch, '-Dict', $script:dict, '-Tool', $script:sz)
+                  '-Arch', $arch, '-Dict', $dictPath, '-Tool', $script:sz)
         if ($threads -gt 0) { $args += @('-Threads', [string]$threads) }
         return (Start-Process powershell -ArgumentList $args -PassThru)
     }
 
     function Wait-ResultFile([string]$arch, [int]$timeoutSec) {
-        $rf = Join-Path (Split-Path -Parent $arch) (([System.IO.Path]::GetFileNameWithoutExtension($arch)) + '_password.txt')
+        $rf = Join-Path $root (([System.IO.Path]::GetFileNameWithoutExtension($arch)) + '_password.txt')
         $deadline = (Get-Date).AddSeconds($timeoutSec)
         while ((Get-Date) -lt $deadline) {
             if (Test-Path $rf) { return $rf }
@@ -139,7 +145,7 @@ try {
     $p = Start-Gui $nf 0
     $finished = Wait-CrackingFinished 20 40
     Start-Sleep -Seconds 3   # let the UI settle after the last pass
-    $rf = Join-Path $tmp 'nf_password.txt'
+    $rf = Join-Path $root 'nf_password.txt'
     Stop-Gui $p
     if ($finished -and -not (Test-Path $rf)) {
         Write-Output '  PASS'
@@ -162,6 +168,59 @@ try {
         Write-Output ("  FAIL (expected 'dragon', got '" + $pw + "')")
         $fail++
     }
+
+    # ---- tests 4-6: dictionary encoding matrix, Chinese passwords ----
+    # The passwords are built from code points so this file stays ASCII.
+    # The 7z command line is Unicode, so only the DICTIONARY decoding
+    # path differs per test. Test 6 (ANSI/GBK, no BOM) also proves the
+    # strict UTF-8 probe skip cannot skip a hit.
+    function Test-Encoding([string]$tag, [System.Text.Encoding]$enc, [string]$pw) {
+        Write-Output ("test " + $tag + ": " + $enc.WebName + " dictionary, Chinese password (expect hit)")
+        $d = Join-Path $tmp ($tag + '-dict.txt')
+        [System.IO.File]::WriteAllLines($d, @('wrong-one', $pw, 'wrong-two'), $enc)
+        $a = New-TestArchive ($tag + '.7z') $pw
+        $p = Start-Gui $a 0 $d
+        $rf = Wait-ResultFile $a 40
+        $got = ''
+        if ($rf) { $got = ([System.IO.File]::ReadAllText($rf, [System.Text.Encoding]::Default)).Trim() }
+        Stop-Gui $p
+        if ($got -eq $pw) { Write-Output '  PASS' }
+        else { Write-Output ("  FAIL (result file content mismatch, length=" + $got.Length + ")"); $fail++ }
+    }
+    # U+5BC6 U+7801 U+6D4B U+8BD5 = Chinese for "password test"; the
+    # fifth char differs per test (one/two/three)
+    Test-Encoding 'enc4' (New-Object System.Text.UTF8Encoding($true))  (-join ([char[]]@(0x5BC6, 0x7801, 0x6D4B, 0x8BD5) + [char]0x4E00))
+    Test-Encoding 'enc5' ([System.Text.Encoding]::Unicode)              (-join ([char[]]@(0x5BC6, 0x7801, 0x6D4B, 0x8BD5) + [char]0x4E8C))
+    Test-Encoding 'enc6' ([System.Text.Encoding]::Default)              (-join ([char[]]@(0x5BC6, 0x7801, 0x6D4B, 0x8BD5) + [char]0x4E09))
+
+    # ---- test 7: Move-PasswordToTop (extracted from the GUI file) ----
+    # The function lives inside the GUI script, which cannot be dot-
+    # sourced (it would open the window). Parse the file and evaluate
+    # just this function definition instead.
+    Write-Output 'test 7: move found password to dictionary line 1'
+    $guiAst = [System.Management.Automation.Language.Parser]::ParseFile($gui, [ref]$null, [ref]$null)
+    $fnDef = $guiAst.Find({ param($a)
+        $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $a.Name -eq 'Move-PasswordToTop' }, $true)
+    if (-not $fnDef) {
+        Write-Output '  FAIL (Move-PasswordToTop not found in GUI script)'
+        $fail++
+    } else {
+        Invoke-Expression $fnDef.Extent.Text
+        $d7 = Join-Path $tmp 'mv-dict.txt'
+        [System.IO.File]::WriteAllLines($d7, @('aaa', 'bbb', 'middle-secret', 'ccc'), (New-Object System.Text.UTF8Encoding($true)))
+        Move-PasswordToTop $d7 'middle-secret' 'utf8bom'
+        $bytes = [System.IO.File]::ReadAllBytes($d7)
+        $bomKept = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+        $lines = [System.IO.File]::ReadAllLines($d7, [System.Text.Encoding]::UTF8)
+        $cnt = @($lines | Where-Object { $_ -eq 'middle-secret' }).Count
+        if ($bomKept -and $lines.Count -eq 4 -and $lines[0] -eq 'middle-secret' -and $cnt -eq 1) {
+            Write-Output '  PASS'
+        } else {
+            Write-Output ("  FAIL (bom=" + $bomKept + ", lines=" + $lines.Count + ", first='" + $lines[0] + "', occurrences=" + $cnt + ")")
+            $fail++
+        }
+    }
 } finally {
     # kill any surviving GUI processes BEFORE restoring the cfg, so a
     # late write cannot land after the restore
@@ -169,6 +228,12 @@ try {
         Where-Object { $_.CommandLine -like ('*' + $gui + '*') } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 800
+    # remove result files the tests dropped next to the GUI script
+    # (real user results in that folder are untouched - only the three
+    # test archive names are cleaned up)
+    foreach ($n in @('hit', 'nf', 't3', 'enc4', 'enc5', 'enc6')) {
+        Remove-Item (Join-Path $root ($n + '_password.txt')) -Force -ErrorAction SilentlyContinue
+    }
     if ($tmp -and (Test-Path $tmp)) {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
