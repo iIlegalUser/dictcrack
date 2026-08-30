@@ -35,8 +35,12 @@ if (-not (Test-Path $cli)) { throw 'dictcrack.exe was not produced' }
 if (-not (Test-Path $gui)) { throw 'dictcrack-gui.exe was not produced' }
 
 # ---- tools -----------------------------------------------------------
-$rar = 'D:\Software\WinRAR\rar.exe'
-if (-not (Test-Path $rar)) { $rar = $null }
+$rar = $null
+foreach ($cand in @('D:\Software\WinRAR\rar.exe',
+    (Join-Path $env:ProgramFiles 'WinRAR\rar.exe'))) {
+    if ($cand -and (Test-Path $cand)) { $rar = $cand; break }
+}
+if (-not $rar) { $c = Get-Command rar.exe -ErrorAction SilentlyContinue; if ($c) { $rar = $c.Source } }
 $sz = $null
 foreach ($cand in @('D:\Software\Scoop\shims\7z.exe',
     (Join-Path $env:ProgramFiles '7-Zip\7z.exe'))) {

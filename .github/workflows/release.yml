@@ -1,0 +1,57 @@
+# DictCrack CI/release: build with the in-box .NET Framework 4.8 csc on
+# Windows runners (no SDK restore needed), attach a zip on every run and
+# publish a GitHub Release when a v* tag is pushed.
+name: build-release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (in-box csc, .NET Framework 4.8)
+        shell: pwsh
+        run: ./build/build.ps1
+
+      - name: Install WinRAR (for RAR5 test fixtures)
+        shell: pwsh
+        run: choco install winrar -y --no-progress
+
+      - name: Run end-to-end tests
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-tests.ps1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'stage'
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item dist/dictcrack.exe, dist/dictcrack-gui.exe, README.md, passwords_sample.txt -Destination $stage
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath "dist/DictCrack-${{ github.ref_name }}.zip"
+          Get-ChildItem dist | ForEach-Object { Write-Output $_.Name }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DictCrack-${{ github.ref_name }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" "dist/DictCrack-${{ github.ref_name }}.zip" `
+            --title "DictCrack ${{ github.ref_name }}" --generate-notes
