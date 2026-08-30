@@ -328,11 +328,16 @@ namespace DictCrack
                 Path.GetFileNameWithoutExtension(archive) + "_password.txt");
             try
             {
-                byte[] text = Encoding.Default.GetBytes(password);
-                byte[] roundtrip = Encoding.Default.GetBytes(Encoding.Default.GetString(text));
+                // explicit GBK (936), never Encoding.Default: the system
+                // ANSI codepage on a non-Chinese locale silently mangles
+                // Chinese passwords into '?' (roundtrip check cannot catch
+                // that loss - a '?' stays '?' through encode/decode)
+                Encoding enc = Encoding.GetEncoding(936);
+                byte[] text = enc.GetBytes(password);
+                byte[] roundtrip = enc.GetBytes(enc.GetString(text));
                 bool lossless = roundtrip.Length == text.Length;
                 for (int i = 0; i < text.Length && lossless; i++) if (roundtrip[i] != text[i]) lossless = false;
-                Encoding enc = lossless ? Encoding.Default : new UTF8Encoding(true);
+                if (!lossless) enc = new UTF8Encoding(true);
                 File.WriteAllText(outPath, password + "\r\n", enc);
                 return outPath;
             }

@@ -140,7 +140,9 @@ try {
     function Read-Result([string]$arch) {
         $p = Result-Path $arch
         if (-not (Test-Path $p)) { return $null }
-        return ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::Default)).Trim()
+        # the tool writes results as explicit GBK(936)/UTF-8-BOM, never the
+        # machine's system ANSI page (CI runners are en-US)
+        return ([System.IO.File]::ReadAllText($p, [System.Text.Encoding]::GetEncoding(936))).Trim()
     }
     function Expect-Hit([string]$name, [string]$arch, [string]$dict, [string]$pw) {
         Remove-Result $arch
@@ -287,7 +289,7 @@ try {
             Start-Sleep -Milliseconds 300
         }
         $got = ''
-        if ($ok) { $got = ([System.IO.File]::ReadAllText($rf, [System.Text.Encoding]::Default)).Trim() }
+        if ($ok) { $got = ([System.IO.File]::ReadAllText($rf, [System.Text.Encoding]::GetEncoding(936))).Trim() }
         if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Milliseconds 500
         if ($ok -and $got -eq 'guipw777') { Pass 'test 17' }
@@ -313,7 +315,7 @@ try {
             Start-Sleep -Milliseconds 300
         }
         $got = ''
-        if ($ok) { $got = ([System.IO.File]::ReadAllText($rf, [System.Text.Encoding]::Default)).Trim() }
+        if ($ok) { $got = ([System.IO.File]::ReadAllText($rf, [System.Text.Encoding]::GetEncoding(936))).Trim() }
         if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Milliseconds 500
         if ($ok -and $got -eq 'foobar99') { Pass 'test 18' }
