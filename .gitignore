@@ -8,3 +8,9 @@ dictcrack-gui.cfg.testbak
 
 # temp files
 *.tmp
+
+# build output
+dist/
+
+# crack session (lives next to the exe)
+session.json
