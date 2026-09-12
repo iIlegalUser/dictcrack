@@ -28,6 +28,8 @@ namespace DictCrack
         public long MaxTries = -1;
         public string UserTool;
         public bool Quiet;
+        public string OutFile;                       // result file path (--out), default next to the exe
+        public bool Dedupe;                          // dictionary mode: drop candidates already tried earlier in the run
 
         public string ParamsHash()
         {
@@ -54,6 +56,7 @@ namespace DictCrack
         public bool Found;
         public string Password;
         public string Error;
+        public string Warning;
         public bool Cancelled;
         public bool MaxedOut;
         public long Tried;
@@ -64,6 +67,7 @@ namespace DictCrack
     public sealed class EngineStats
     {
         private long _tried;
+        private long _baseTried;                 // candidates already tried before a resume
         private long _total = -1;
         private volatile string _phase = "准备中";
         private volatile string _current = "";
@@ -74,6 +78,7 @@ namespace DictCrack
         public long Tried { get { return Interlocked.Read(ref _tried); } }
         public void AddTried() { Interlocked.Increment(ref _tried); }
         public bool Reached(long n) { return Interlocked.Read(ref _tried) >= n; }
+        public long BaseTried { get { return Interlocked.Read(ref _baseTried); } set { Interlocked.Exchange(ref _baseTried, value); } }
         public long Total { get { return Interlocked.Read(ref _total); } set { Interlocked.Exchange(ref _total, value); } }
         public string Phase { get { return _phase; } set { _phase = value; } }
         public string Current { get { return _current; } set { _current = value ?? ""; } }
@@ -124,13 +129,13 @@ namespace DictCrack
             if (!verifier.Native && !ProbeEncrypted(archive, _cfg.UserTool))
             { res.Error = "该压缩包没有密码保护，无需破解。"; return res; }
 
-            ZipVerifier.ArchivePath = archive;
+            ZipVerifier.ResetCache(archive);
             SpawnVerifier.ArchivePath = archive;
             EngineParamsHash.Value = _cfg.ParamsHash();
+            EngineParamsHash.DictFp = DictFingerprint(_cfg);
             ICandidateSource source;
             try { source = BuildSource(); }
             catch (Exception ex) { res.Error = "构造攻击计划失败: " + ex.Message; return res; }
-            if (LogNote.Length > 0) { /* encoding plan notes surface via Stats.Phase */ }
 
             SourcePosition pos = new SourcePosition();
             SessionState sess = null;
@@ -138,7 +143,7 @@ namespace DictCrack
             {
                 if (_cfg.ResumeRequested) sess = SessionState.Load(SessionPath);
                 else DeleteSession();
-                if (sess != null && (!sess.Matches(archive, _cfg.ParamsHash())))
+                if (sess != null && (!sess.Matches(archive, _cfg.ParamsHash(), EngineParamsHash.DictFp)))
                 {
                     sess = null;
                     LogNote = "已忽略不匹配的历史会话";
@@ -160,6 +165,23 @@ namespace DictCrack
                 int cores = Environment.ProcessorCount;
                 threads = Math.Max(1, Math.Min(32, cores - 2));
             }
+            long sessionTried = 0;
+            if (sess != null)
+            {
+                // the producer runs ahead of the verifiers: candidates still
+                // sitting in the queue or mid-Verify when the run stopped are
+                // not covered by the saved position. Rewind a safety margin -
+                // re-trying a handful of candidates is harmless, skipping
+                // them would miss passwords.
+                long margin = threads * 8 + threads + 16;
+                pos.LineIdx = pos.LineIdx > margin ? pos.LineIdx - margin : 0;
+                pos.Counter = pos.Counter > (ulong)margin ? pos.Counter - (ulong)margin : 0;
+                pos.IdxB = pos.IdxB > margin ? pos.IdxB - margin : 0;
+                pos.IdxA = pos.IdxA > margin ? pos.IdxA - margin : 0;
+                if (pos.IdxA < sess.IdxA) pos.IdxB = 0;   // earlier A line: B restarts
+                sessionTried = sess.TriedAll;
+            }
+            Stats.BaseTried = sessionTried;
             Stats.Phase = Stats.Phase.StartsWith("续跑", StringComparison.Ordinal)
                 ? Stats.Phase : verifier.Describe();
 
@@ -168,7 +190,6 @@ namespace DictCrack
             CancellationToken ct = cts.Token;
 
             SourcePosition livePos = pos; // producer mutates it; checkpoint thread snapshots
-            long sessionTried = sess != null ? sess.TriedAll : 0;
 
             Thread producer = new Thread(delegate()
             {
@@ -231,7 +252,8 @@ namespace DictCrack
                 checkpointTimer = new Timer(delegate(object state)
                 {
                     if (!Stats.Done && hitPassword == null)
-                        SaveSession(archive, source, livePos, sessionTried + Stats.Tried);
+                        if (!SaveSession(archive, source, livePos, Stats.BaseTried + Stats.Tried))
+                            _sessionSaveFailed = true;
                 }, null, 3000, 3000);
             }
 
@@ -243,7 +265,7 @@ namespace DictCrack
             Stats.Done = true;
             sw.Stop();
 
-            res.Tried = sessionTried + Stats.Tried;
+            res.Tried = Stats.BaseTried + Stats.Tried;
             res.ElapsedSec = sw.Elapsed.TotalSeconds;
             res.Cancelled = external.IsCancellationRequested && hitPassword == null;
             res.MaxedOut = MaxedOut;
@@ -252,13 +274,14 @@ namespace DictCrack
             {
                 res.Found = true;
                 res.Password = hitPassword;
-                res.ResultFile = WriteResultFile(archive, hitPassword);
+                res.ResultFile = WriteResultFile(archive, hitPassword, _cfg.OutFile);
                 DeleteSession();
             }
             else if (res.Cancelled || MaxedOut)
             {
                 if (_cfg.CheckpointEnabled)
-                    SaveSession(archive, source, livePos, sessionTried + Stats.Tried);
+                    if (!SaveSession(archive, source, livePos, Stats.BaseTried + Stats.Tried))
+                        _sessionSaveFailed = true;
                 if (ProducerError != null) res.Error = "候选生成失败: " + ProducerError;
                 else if (WorkerError != null) res.Error = "验证线程错误: " + WorkerError;
             }
@@ -268,11 +291,13 @@ namespace DictCrack
                 if (ProducerError != null) res.Error = "候选生成失败: " + ProducerError;
                 else if (WorkerError != null) res.Error = "验证线程错误: " + WorkerError;
             }
+            if (_sessionSaveFailed && !res.Found)
+                res.Warning = "会话/进度文件写入失败（exe 目录可能只读），断点续跑不可用。";
             if (source is DictionarySource) LogNote = ((DictionarySource)source).LastPlanNote;
             return res;
         }
 
-        private long StatsTriedRef { get { return Stats.Tried; } }
+        private bool _sessionSaveFailed;
         private volatile bool MaxedOut;        private volatile string ProducerError;
         private volatile string WorkerError;
 
@@ -292,8 +317,8 @@ namespace DictCrack
             }
             if (_cfg.DictFiles.Count == 0) throw new ApplicationException("没有指定字典文件。");
             foreach (string f in _cfg.DictFiles)
-                if (!File.Exists(f)) throw new ApplicationException("字典文件不存在: " + f);
-            return new DictionarySource(_cfg.DictFiles, _cfg.Presets);
+                if (f != "-" && !File.Exists(f)) throw new ApplicationException("字典文件不存在: " + f);
+            return new DictionarySource(_cfg.DictFiles, _cfg.Presets, _cfg.Dedupe);
         }
 
         private static int CountTokens(string mask)
@@ -322,43 +347,79 @@ namespace DictCrack
             return !probe.Verify("");   // empty password: 0 = no password prompt needed
         }
 
-        private static string WriteResultFile(string archive, string password)
+        private static string WriteResultFile(string archive, string password, string outFile)
         {
-            string outPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+            string defaultPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
                 Path.GetFileNameWithoutExtension(archive) + "_password.txt");
+            if (!string.IsNullOrEmpty(outFile))
+            {
+                try { WriteResultText(outFile, password); return outFile; }
+                catch { }   // unwritable -- fall through to the default location
+            }
+            try { WriteResultText(defaultPath, password); return defaultPath; }
+            catch { return null; }
+        }
+
+        private static void WriteResultText(string path, string password)
+        {
+            // explicit GBK (936), never Encoding.Default: the system
+            // ANSI codepage on a non-Chinese locale silently mangles
+            // Chinese passwords into '?' (roundtrip check cannot catch
+            // that loss - a '?' stays '?' through encode/decode)
+            Encoding enc = Encoding.GetEncoding(936);
+            byte[] text = enc.GetBytes(password);
+            byte[] roundtrip = enc.GetBytes(enc.GetString(text));
+            bool lossless = roundtrip.Length == text.Length;
+            for (int i = 0; i < text.Length && lossless; i++) if (roundtrip[i] != text[i]) lossless = false;
+            if (!lossless) enc = new UTF8Encoding(true);
+            File.WriteAllText(path, password + "\r\n", enc);
+        }
+
+        // content fingerprint of every dictionary feeding the run: a resume
+        // position (line/counter indices) into an edited dictionary is
+        // meaningless, so a changed size/mtime invalidates the session
+        public static string DictFingerprint(CrackConfig cfg)
+        {
+            if (cfg.Mode == "mask") return "";
             try
             {
-                // explicit GBK (936), never Encoding.Default: the system
-                // ANSI codepage on a non-Chinese locale silently mangles
-                // Chinese passwords into '?' (roundtrip check cannot catch
-                // that loss - a '?' stays '?' through encode/decode)
-                Encoding enc = Encoding.GetEncoding(936);
-                byte[] text = enc.GetBytes(password);
-                byte[] roundtrip = enc.GetBytes(enc.GetString(text));
-                bool lossless = roundtrip.Length == text.Length;
-                for (int i = 0; i < text.Length && lossless; i++) if (roundtrip[i] != text[i]) lossless = false;
-                if (!lossless) enc = new UTF8Encoding(true);
-                File.WriteAllText(outPath, password + "\r\n", enc);
-                return outPath;
+                List<string> files = new List<string>();
+                if (cfg.Mode == "comb")
+                {
+                    if (cfg.DictFiles.Count > 0) files.Add(cfg.DictFiles[0]);
+                    if (cfg.DictFileB != null) files.Add(cfg.DictFileB);
+                }
+                else files.AddRange(cfg.DictFiles);
+                StringBuilder sb = new StringBuilder();
+                foreach (string f in files)
+                {
+                    if (f == "-") { sb.Append("stdin;"); continue; }
+                    FileInfo fi = new FileInfo(f);
+                    if (!fi.Exists) return null;
+                    sb.Append(fi.Length).Append(':').Append(fi.LastWriteTimeUtc.Ticks).Append(';');
+                }
+                return sb.ToString();
             }
             catch { return null; }
         }
 
-        private static void SaveSession(string archive, ICandidateSource source, SourcePosition pos, long tried)
+        private static bool SaveSession(string archive, ICandidateSource source, SourcePosition pos, long tried)
         {
             SessionState s = new SessionState();
-            s.Archive = archive; s.Params = EngineParamsHash.Value; s.TriedAll = tried;
+            s.Archive = archive; s.Params = EngineParamsHash.Value; s.DictFp = EngineParamsHash.DictFp;
+            s.TriedAll = tried;
             s.FileIdx = pos.FileIdx; s.LineIdx = pos.LineIdx;
             s.Seg = pos.Seg; s.Counter = pos.Counter;
             s.IdxA = pos.IdxA; s.IdxB = pos.IdxB;
             s.SaveTimeText = DateTime.Now.ToString("HH:mm:ss");
-            s.Save(SessionPath);
+            return s.Save(SessionPath);
         }
 
         // set by Run before any checkpoint can fire
         internal static class EngineParamsHash
         {
             public static string Value;
+            public static string DictFp;
         }
 
         private static void DeleteSession()
@@ -372,6 +433,7 @@ namespace DictCrack
     {
         public string Archive;
         public string Params;
+        public string DictFp;       // dictionary size/mtime fingerprint; edited dicts invalidate the session
         public long TriedAll;
         public int FileIdx;
         public long LineIdx;
@@ -381,17 +443,20 @@ namespace DictCrack
         public long IdxB;
         public string SaveTimeText;
 
-        public bool Matches(string archive, string paramsHash)
+        public bool Matches(string archive, string paramsHash, string dictFp)
         {
-            return string.Equals(Archive, archive, StringComparison.OrdinalIgnoreCase) && Params == paramsHash;
+            if (!string.Equals(Archive, archive, StringComparison.OrdinalIgnoreCase) || Params != paramsHash) return false;
+            if (dictFp == null) return true;        // fingerprint unavailable: keep the old lenient behavior
+            return DictFp == dictFp;                // sessions saved before this field existed fail for dict runs (safe restart)
         }
 
-        public void Save(string path)
+        public bool Save(string path)
         {
             StringBuilder sb = new StringBuilder();
             sb.Append("{\n");
             AppendKv(sb, "archive", Archive); sb.Append(",\n");
             AppendKv(sb, "params", Params); sb.Append(",\n");
+            AppendKv(sb, "dictfp", DictFp); sb.Append(",\n");
             sb.Append("  \"tried\": ").Append(TriedAll).Append(",\n");
             sb.Append("  \"fileIdx\": ").Append(FileIdx).Append(",\n");
             sb.Append("  \"lineIdx\": ").Append(LineIdx).Append(",\n");
@@ -407,8 +472,9 @@ namespace DictCrack
                 File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));
                 try { File.Replace(tmp, path, null); }
                 catch { File.Copy(tmp, path, true); try { File.Delete(tmp); } catch { } }
+                return true;
             }
-            catch { }
+            catch { return false; }
         }
 
         private static void AppendKv(StringBuilder sb, string key, string val)
@@ -463,6 +529,7 @@ namespace DictCrack
                 string tmp;
                 kv.TryGetValue("archive", out s.Archive);
                 kv.TryGetValue("params", out s.Params);
+                kv.TryGetValue("dictfp", out s.DictFp);
                 kv.TryGetValue("saveTime", out s.SaveTimeText);
                 s.TriedAll = kv.TryGetValue("tried", out tmp) ? ParseLong(tmp) : 0;
                 s.FileIdx = kv.TryGetValue("fileIdx", out tmp) ? (int)ParseLong(tmp) : 0;

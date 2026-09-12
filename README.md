@@ -10,7 +10,7 @@ Windows 下的压缩包密码恢复工具。核心是 **C# 原生验证引擎**�
 |---|---|---|---|
 | 原生头部校验（不启动子进程） | ✔ | ✔ | ✔（RAR5/ZIP） |
 | 字典 / 掩码 / 组合攻击 | ✔ | 部分 | ✔ |
-| 规则变异（年份、数字、leet…） | ✔（规则语言） | 部分 | 内置 6 种中文场景预设 |
+| 规则变异（年份、数字、leet…） | ✔（规则语言） | 部分 | 内置 6 种中文场景预设（链式叠加） |
 | 断点续跑（checkpoint/restore） | ✔ | ✔ | ✔（自动保存、可交互续跑） |
 | 基准测速 | ✔ | ✗ | ✔（按真实压缩包测 H/s） |
 | 中文密码 / GBK 字典处理 | 需自行转换 | 部分 | ✔ 编码自动遍历（UTF-8/UTF-16/GBK） |
@@ -62,15 +62,26 @@ powershell -ExecutionPolicy Bypass -File build\build.ps1
 
 ```
 dictcrack crack -a <压缩包> -w <字典> [--rule years,digits,leet,rev,cap,double] [-t 线程]
+                [--out 结果文件] [--dedupe]
+dictcrack crack -a <压缩包> -w -                              # 从 stdin 读字典
 dictcrack crack -a <压缩包> --mask "前缀?d?d?d?d" [-1 自定义字符集] [--min N --max N]
 dictcrack crack -a <压缩包> -w <字典A> -w2 <字典B>          # 组合攻击
-dictcrack info  <压缩包>      # 格式 / 加密方式 / KDF 轮数 / 验证路径
+dictcrack info  <压缩包> [--hashcat]   # 格式 / 加密方式 / KDF 轮数 / 验证路径
+                                       # --hashcat: 导出 hashcat -m 13000（RAR5）格式 hash
 dictcrack bench -a <压缩包>   # 基准测速（需要 RAR5 或加密 ZIP）
 ```
 
 常用选项：`--resume`（从中断处继续）、`--max-tries N`（限次停止，测试用）、
-`--extract-to <目录>`（命中后自动解压）、`--out <文件>`（结果文件路径）、`-q`（静默）。
+`--extract-to <目录>`（命中后自动解压）、`--out <文件>`（结果文件路径，默认
+`<压缩包名>_password.txt`）、`--dedupe`（字典模式跨行去重，内存换时间）、
+`--tool <exe>`（后备验证工具路径，也可用环境变量 `DICTCRACK_TOOL` 指定
+7z.exe/rar.exe）、`-q`（静默）。字典可给多个 `-w`，`-w -` 从标准输入读入。
 退出码：`0` 找到密码，`1` 未找到，`2` 出错，`3` 已停止（可 `--resume`）。
+
+变异规则按选择顺序**链式叠加**：每个预设也会变异前面预设的输出，如
+`--rule years,digits` 会产出 `词+年份` 与 `词+年份+数字` 两层形态，覆盖
+"词+年份+数字"类组合；单行候选扇出上限 100000，防止组合爆炸。`years` 的
+年份范围为 1980 到当前年份+1（动态）。
 
 掩码占位符：`?l` 小写 `?u` 大写 `?d` 数字 `?s` 特殊 `?a` 全部 `?h/?H` 十六进制
 `?1..?4` 自定义字符集。
@@ -78,8 +89,14 @@ dictcrack bench -a <压缩包>   # 基准测速（需要 RAR5 或加密 ZIP）
 示例：
 
 ```powershell
-# 字典 + 年份/数字变异
+# 字典 + 年份/数字变异（链式：词+年份、词+年份+数字都会试到）
 dictcrack crack -a game.rar -w cnwords.txt --rule years,digits
+
+# 结果写到指定文件
+dictcrack crack -a game.rar -w cnwords.txt --out D:\found.txt
+
+# 管道喂字典
+type words.txt | dictcrack crack -a game.rar -w -
 
 # 六位纯数字掩码
 dictcrack crack -a game.rar --mask "?d?d?d?d?d?d" -t 24
@@ -88,19 +105,28 @@ dictcrack crack -a game.rar --mask "?d?d?d?d?d?d" -t 24
 dictcrack crack -a game.rar -w big.txt --resume
 ```
 
+`--resume` 说明：恢复时会回退一个安全余量（约 threads×8+threads+16 个候选），
+覆盖取消瞬间仍在队列中的候选；会话记录字典 size+mtime 指纹，字典被编辑过则
+自动忽略旧会话重跑；会话文件写入失败会给出警告，不再静默。无法识别的命令行
+选项会打印警告并忽略（防止拼写错误静默跑错模式）。Ctrl+C 第一次优雅
+停止（进度已保存），第二次强制退出。
+
 ## 架构
 
 ```
 src\
   Crypto.cs      托管/原生 PBKDF2（每线程 CNG 句柄）、CRC32
-  ArchiveInfo.cs RAR5 头链解析（vint/加密头记录）、ZIP 中央目录解析、格式识别
-  Verifier.cs    Rar5Verifier / ZipVerifier（含 ZipCrypto 全量确认）/ 7z 进程回退
-  Attacks.cs     字典（多编码遍历+变异）、掩码、组合三种候选源（可序列化进度）
+  ArchiveInfo.cs RAR5 头链解析（vint/加密头记录）、ZIP 中央目录解析（含 ZIP64，支持
+                 >4GB / >65535 条目）、格式识别
+  Verifier.cs    Rar5Verifier / ZipVerifier（含 ZipCrypto 全量确认；确认阶段将目标
+                 条目缓存进内存，≤64MB，减少高线程数下的重复磁盘 I/O）/ 7z 进程回退
+  Attacks.cs     字典（多编码遍历+链式变异，支持 stdin）、掩码、组合三种候选源（可序列化进度）
   Engine.cs      生产者-消费者线程编排、断点会话、统计、基准
   Cli.cs         命令行前端
   Gui.cs         WinForms 前端（扁平设计、拖放、DPI 缩放）
 build\build.ps1  csc 编译脚本（CLI + GUI）
-tests\run-tests.ps1  端到端测试（17 项，WinRAR/7z 现场造样本）
+tests\run-tests.ps1    端到端测试（18 项，WinRAR/7z 现场造样本）
+tests\unit-tests.ps1   纯单元测试（无外部工具依赖）
 legacy\          旧版 PowerShell GUI 套件（已被原生引擎版取代，保留备查）
 ```
 
@@ -108,22 +134,32 @@ legacy\          旧版 PowerShell GUI 套件（已被原生引擎版取代，�
 路径；RAR 1.5-4.x、7z 及其他 7-Zip 认识的格式自动回退外部工具测试。不支持的
 RAR5（无密码校验数据）同样回退。
 
-字典编码：按 BOM 识别 UTF-8/UTF-16；无 BOM 时先做严格 UTF-8 探测，合法则
-UTF-8 + GBK 双遍历（同一行去重），否则只跑 GBK——GBK 字典不会浪费 UTF-8 遍。
+字典编码：按 BOM 识别 UTF-8/UTF-16（UTF-8 BOM 正确剥离，首行候选不带 U+FEFF）；
+无 BOM 时先做严格 UTF-8 探测，合法则 UTF-8 + GBK 双遍历（同一行去重），否则只跑
+GBK——GBK 字典不会浪费 UTF-8 遍。组合攻击对字典 A、B 都执行同一套编码扫描
+（UTF-8/GBK 遍历），UTF-8 的字典 B 不会再被当 GBK 读成乱码。
 
 ## 测试
 
 ```powershell
+# 端到端（需要 7-Zip 造 ZIP/7z 样本，WinRAR 的 rar.exe 造 RAR5 样本）
 powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
+
+# 纯单元测试（无外部工具依赖）
+powershell -ExecutionPolicy Bypass -File tests\unit-tests.ps1
 ```
 
-需要 7-Zip（造 ZIP/7z 样本）与 WinRAR 的 `rar.exe`（造 RAR5 样本；RAR 7 已不能
-生成 RAR4 格式）。测试覆盖：五种加密路径的字典命中、未加密报错、掩码/组合/规则、
-UTF-8 BOM / UTF-16LE / GBK 中文密码矩阵、断点续跑、基准、GUI 自动启动。
+run-tests.ps1 需要 7-Zip 与 WinRAR 的 `rar.exe`（RAR 7 已不能生成 RAR4 格式）。
+覆盖：五种加密路径的字典命中、未加密报错、掩码/组合/规则、UTF-8 BOM /
+UTF-16LE / GBK 中文密码矩阵、断点续跑、基准、GUI 自动启动。
+
+unit-tests.ps1 把引擎源码与 unittests.cs 编译成独立程序集直接跑，覆盖 PBKDF2
+已知向量、会话序列化往返、ZIP64 合成样本、掩码/规则/行切分/编码计划等。
 
 ## 已知限制
 
-- 纯 CPU：RAR5 的 PBKDF2（默认 2^15 轮）是格式强制的，有 GPU 请用 hashcat（可
-  用 `info` 查看轮数自行提取 hash）。
+- 纯 CPU：RAR5 的 PBKDF2（默认 2^15 轮）是格式强制的，有 GPU 请用 hashcat
+  （`dictcrack info <压缩包> --hashcat` 可直接导出 hashcat -m 13000 格式 hash）。
 - 外部工具回退路径的候选不能含换行/引号（命令行传参限制）；原生路径无此限制。
 - 组合攻击会把字典 B 整体载入内存。
+- RAR 1.5-4.x 仍走外部工具回退，RAR4 原生化未实现。

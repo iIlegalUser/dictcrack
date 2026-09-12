@@ -40,62 +40,139 @@ namespace DictCrack
     }
 
     // ------------------------------------------------------------------
+    // raw byte line splitter shared by the dictionary and combinator
+    // sources: 0x0A can never appear inside a UTF-8/GBK multibyte char, so
+    // byte-level splitting is safe for the sweep encodings (UTF-16 uses
+    // the framework reader instead). Segments are valid only until the
+    // next MoveNext - the caller decodes before asking for more.
+    public struct RawLine
+    {
+        public byte[] Buf;
+        public int Offset;
+        public int Count;
+        public long Index;
+    }
+
+    public static class RawLines
+    {
+        public static IEnumerable<RawLine> Enumerate(Stream fs, long startOffset, System.Threading.CancellationToken ct)
+        {
+            if (startOffset > 0) fs.Seek(startOffset, SeekOrigin.Begin);
+            byte[] buf = new byte[1 << 20];
+            int fill = 0;
+            long idx = 0;
+            while (true)
+            {
+                if (ct.IsCancellationRequested) yield break;
+                int n = fs.Read(buf, fill, buf.Length - fill);
+                bool eof = n == 0;
+                int end = fill + n;
+                int start = 0;
+                for (int i = 0; i < end; i++)
+                {
+                    if (buf[i] == 0x0A)
+                    {
+                        int len = i - start;
+                        if (len > 0 && buf[start + len - 1] == 0x0D) len--;
+                        yield return new RawLine { Buf = buf, Offset = start, Count = len, Index = idx++ };
+                        start = i + 1;
+                    }
+                }
+                int keep = end - start;
+                if (!eof && keep == end && end == buf.Length)
+                {
+                    // single line longer than the buffer: grow
+                    byte[] nb = new byte[buf.Length * 2];
+                    Array.Copy(buf, nb, end);
+                    buf = nb;
+                    fill = end;
+                    continue;
+                }
+                if (eof)
+                {
+                    int len = keep;
+                    if (len > 0 && buf[start + len - 1] == 0x0D) len--;
+                    if (len > 0) yield return new RawLine { Buf = buf, Offset = start, Count = len, Index = idx++ };
+                    yield break;
+                }
+                // move the partial line to the front and refill
+                Array.Copy(buf, start, buf, 0, keep);
+                fill = keep;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     public static class DictEncoding
     {
+        // path convenience wrapper (the stream position is irrelevant here)
         public static List<Encoding> Plan(string path, out string planNote)
         {
-            List<Encoding> encs = new List<Encoding>();
+            long skip;
             using (FileStream fs = File.OpenRead(path))
             {
-                int b0 = fs.ReadByte(), b1 = fs.ReadByte(), b2 = fs.ReadByte();
-                if (b0 == 0xEF && b1 == 0xBB && b2 == 0xBF)
-                {
-                    encs.Add(new UTF8Encoding(false, true));
-                    planNote = "UTF-8 (BOM)";
-                    return encs;
-                }
-                if (b0 == 0xFF && b1 == 0xFE)
-                {
-                    encs.Add(new UnicodeEncoding(false, true, true));
-                    planNote = "UTF-16LE (BOM)";
-                    return encs;
-                }
-                if (b0 == 0xFE && b1 == 0xFF)
-                {
-                    encs.Add(new UnicodeEncoding(true, true, true));
-                    planNote = "UTF-16BE (BOM)";
-                    return encs;
-                }
+                return Plan(fs, out planNote, out skip);
             }
+        }
+
+        // Plans the encoding sweep for a stream (position is left where it
+        // was). bomSkip tells the raw byte splitter how many bytes of a
+        // UTF-8 BOM to skip so the first line does not carry a U+FEFF;
+        // UTF-16 BOMs are consumed by StreamReader itself.
+        public static List<Encoding> Plan(Stream fs, out string planNote, out long bomSkip)
+        {
+            bomSkip = 0;
+            long pos0 = fs.Position;
+            List<Encoding> encs = new List<Encoding>();
+            int b0 = fs.ReadByte(), b1 = fs.ReadByte(), b2 = fs.ReadByte();
+            if (b0 == 0xEF && b1 == 0xBB && b2 == 0xBF)
+            {
+                encs.Add(new UTF8Encoding(false, true));
+                planNote = "UTF-8 (BOM)";
+                bomSkip = 3;
+                fs.Position = pos0;
+                return encs;
+            }
+            if (b0 == 0xFF && b1 == 0xFE)
+            {
+                encs.Add(new UnicodeEncoding(false, true, true));
+                planNote = "UTF-16LE (BOM)";
+                fs.Position = pos0;
+                return encs;
+            }
+            if (b0 == 0xFE && b1 == 0xFF)
+            {
+                encs.Add(new UnicodeEncoding(true, true, true));
+                planNote = "UTF-16BE (BOM)";
+                fs.Position = pos0;
+                return encs;
+            }
+            fs.Position = pos0;
             // no BOM: strict-decode the first 256 KB as UTF-8; trim trailing
             // high bytes so a cut inside a multibyte sequence cannot fake an
             // illegal one. Valid UTF-8 keeps both passes, GBK text runs
             // ANSI(GBK) alone - a probe can only save time, never skip a hit.
-            List<Encoding> both = new List<Encoding>();
-            both.Add(new UTF8Encoding(false, true));
-            both.Add(GetAnsi());
             try
             {
-                using (FileStream fs = File.OpenRead(path))
+                long len = fs.Length - pos0;
+                int probeLen = (int)Math.Min(262144L, len);
+                byte[] buf = new byte[probeLen];
+                ArchiveParser.ReadFull(fs, buf);
+                fs.Position = pos0;   // the caller keeps reading from the start
+                if (probeLen < len)
                 {
-                    long len = fs.Length;
-                    int probeLen = (int)Math.Min(262144L, len);
-                    byte[] buf = new byte[probeLen];
-                    ArchiveParser.ReadFull(fs, buf);
-                    if (probeLen < len)
-                    {
-                        int valid = probeLen;
-                        while (valid > 0 && buf[valid - 1] >= 0x80) valid--;
-                        byte[] buf2 = new byte[valid];
-                        Array.Copy(buf, buf2, valid);
-                        buf = buf2;
-                    }
-                    Encoding strict = new UTF8Encoding(false, true);
-                    strict.GetString(buf);
-                    encs.Add(both[0]); encs.Add(both[1]);
-                    planNote = "UTF-8 + ANSI(GBK)";
-                    return encs;
+                    int valid = probeLen;
+                    while (valid > 0 && buf[valid - 1] >= 0x80) valid--;
+                    byte[] buf2 = new byte[valid];
+                    Array.Copy(buf, buf2, valid);
+                    buf = buf2;
                 }
+                Encoding strict = new UTF8Encoding(false, true);
+                strict.GetString(buf);
+                encs.Add(strict);
+                encs.Add(GetAnsi());
+                planNote = "UTF-8 + ANSI(GBK)";
+                return encs;
             }
             catch { }
             encs.Add(GetAnsi());
@@ -129,13 +206,15 @@ namespace DictCrack
     }
 
     // ------------------------------------------------------------------
-    // mutation presets - each independently emits extra candidates after
-    // the base word (no cross-products; documented in README)
+    // mutation presets - chained: with several presets selected each one
+    // also mutates the outputs of the presets before it (word -> word+year
+    // -> word+year+digits), which covers the common "word+year+number"
+    // password shapes; per-line dedup and a fan-out cap keep it bounded
     public static class Rules
     {
         public static readonly string[] PresetNames = new string[] { "years", "digits", "leet", "rev", "cap", "double" };
         public static readonly string[] PresetDescZh = new string[] {
-            "年份后缀 1980-2026", "数字后缀 0-9/00-99", "leet 变形(a@e3o0i1s5g9)",
+            "年份后缀 1980-今年+1", "数字后缀 0-9/00-99", "leet 变形(a@e3o0i1s5g9)",
             "倒序", "首字母大写", "双写(abcabc)" };
 
         public static IEnumerable<string> Apply(string preset, string w)
@@ -144,7 +223,8 @@ namespace DictCrack
             switch (preset)
             {
                 case "years":
-                    for (int y = 1980; y <= 2026; y++) yield return w + y.ToString();
+                    int yMax = DateTime.Now.Year + 1;
+                    for (int y = 1980; y <= yMax; y++) yield return w + y.ToString();
                     break;
                 case "digits":
                     for (int d = 0; d <= 9; d++) yield return w + (char)('0' + d);
@@ -182,12 +262,20 @@ namespace DictCrack
     {
         private readonly List<string> _files;
         private readonly List<string> _presets;
+        private readonly HashSet<string> _global;   // cross-line dedupe (--dedupe); null otherwise
         private long _countedTotal = -1;
         public string LastPlanNote = "";
 
-        public DictionarySource(List<string> files, List<string> presets)
+        // cap on chained mutation outputs per line: without it a long
+        // preset stack could explode combinatorially
+        private const int MutationCap = 100000;
+
+        public DictionarySource(List<string> files, List<string> presets) : this(files, presets, false) { }
+
+        public DictionarySource(List<string> files, List<string> presets, bool dedupe)
         {
             _files = files; _presets = presets;
+            _global = dedupe ? new HashSet<string>(StringComparer.Ordinal) : null;
         }
 
         public long? Total
@@ -203,6 +291,7 @@ namespace DictCrack
                     long t = 0;
                     foreach (string f in _files)
                     {
+                        if (f == "-") { _countedTotal = -1; return null; }  // stdin: unknown length
                         try { t += CountLines(f); } catch { }
                     }
                     _countedTotal = t;
@@ -217,7 +306,7 @@ namespace DictCrack
             for (int i = 0; i < _files.Count; i++)
             {
                 if (i > 0) sb.Append(", ");
-                sb.Append(Path.GetFileName(_files[i]));
+                sb.Append(_files[i] == "-" ? "(stdin)" : Path.GetFileName(_files[i]));
             }
             if (_presets.Count > 0) sb.Append(" + ").Append(string.Join("/", _presets.ToArray()));
             return sb.ToString();
@@ -248,113 +337,78 @@ namespace DictCrack
             return count + (inLine ? 1 : 0);
         }
 
+        private static Stream LoadStdin()
+        {
+            MemoryStream ms = new MemoryStream();
+            using (Stream stdin = Console.OpenStandardInput())
+            {
+                byte[] buf = new byte[1 << 16];
+                int n;
+                while ((n = stdin.Read(buf, 0, buf.Length)) > 0) ms.Write(buf, 0, n);
+            }
+            ms.Position = 0;
+            return ms;
+        }
+
         public IEnumerable<Candidate> Enumerate(SourcePosition pos, System.Threading.CancellationToken ct)
         {
+            // reused across lines (producer thread only) - allocating a
+            // fresh dictionary per line showed up as GC pressure at the
+            // million-candidates-per-second scale
+            Dictionary<string, string> emitted = new Dictionary<string, string>(32);
             for (int fi = 0; fi < _files.Count; fi++)
             {
                 if (fi < pos.FileIdx) continue;
                 pos.FileIdx = fi;
                 string path = _files[fi];
-                if (!File.Exists(path)) continue;
-                string note;
-                List<Encoding> encs = DictEncoding.Plan(path, out note);
-                LastPlanNote = note;
-                bool utf16 = encs.Count == 1 && (encs[0].CodePage == 1200 || encs[0].CodePage == 1201);
-
-                if (utf16)
+                Stream stream;
+                List<Encoding> encs; string note; long bomSkip;
+                if (path == "-")
                 {
-                    // UTF-16 bytes can contain 0x0A inside a character, so
-                    // split with the framework reader and decode once
-                    string tag = DictEncoding.EncLabel(encs[0]);
-                    long lineIdx = 0;
-                    using (StreamReader sr = new StreamReader(path, encs[0]))
+                    stream = LoadStdin();
+                    encs = DictEncoding.Plan(stream, out note, out bomSkip);
+                }
+                else
+                {
+                    if (!File.Exists(path)) continue;
+                    stream = File.OpenRead(path);
+                    encs = DictEncoding.Plan(stream, out note, out bomSkip);
+                }
+                LastPlanNote = note;
+                using (stream)
+                {
+                    bool utf16 = encs.Count == 1 && (encs[0].CodePage == 1200 || encs[0].CodePage == 1201);
+                    if (utf16)
                     {
-                        string line;
-                        while ((line = sr.ReadLine()) != null)
+                        // UTF-16 bytes can contain 0x0A inside a character, so
+                        // split with the framework reader and decode once
+                        string tag = DictEncoding.EncLabel(encs[0]);
+                        long lineIdx = 0;
+                        using (StreamReader sr = new StreamReader(stream, encs[0]))
                         {
-                            if (ct.IsCancellationRequested) yield break;
-                            if (lineIdx++ < pos.LineIdx) continue;
-                            pos.LineIdx = lineIdx - 1;
-                            Dictionary<string, string> emitted = new Dictionary<string, string>();
-                            string t = Sanitize(line);
-                            if (t != null && !emitted.ContainsKey(t))
+                            string line;
+                            while ((line = sr.ReadLine()) != null)
                             {
-                                emitted[t] = tag;
+                                if (ct.IsCancellationRequested) yield break;
+                                if (lineIdx < pos.LineIdx) { lineIdx++; continue; }
+                                pos.LineIdx = lineIdx;
+                                lineIdx++;
+                                string t = Sanitize(line);
+                                if (t == null) continue;
+                                if (_global != null && !_global.Add(t)) continue;
                                 yield return new Candidate(t, tag);
                             }
                         }
                     }
-                }
-                else
-                {
-                    // raw byte line splitting is safe for UTF-8/GBK: the
-                    // byte 0x0A can never appear inside a multibyte char.
-                    // Decode each line under every planned encoding (the
-                    // encoding sweep), skipping duplicates within the line.
-                    long lineIdx = 0;
-                    using (FileStream fs = File.OpenRead(path))
+                    else
                     {
-                        byte[] buf = new byte[1 << 20];
-                        List<ArraySegment<byte>> parts = new List<ArraySegment<byte>>(4096);
-                        int fill = 0;
-                        while (true)
+                        foreach (RawLine rl in RawLines.Enumerate(stream, bomSkip, ct))
                         {
-                            if (ct.IsCancellationRequested) yield break;
-                            int n = fs.Read(buf, fill, buf.Length - fill);
-                            bool eof = n == 0;
-                            int end = fill + n;
-                            parts.Clear();
-                            int start = 0;
-                            for (int i = 0; i < end; i++)
-                            {
-                                if (buf[i] == 0x0A)
-                                {
-                                    int len = i - start;
-                                    if (len > 0 && buf[start + len - 1] == 0x0D) len--;
-                                    parts.Add(new ArraySegment<byte>(buf, start, len));
-                                    start = i + 1;
-                                }
-                            }
-                            int keep = end - start;
-                            if (!eof && keep == end && end == buf.Length)
-                            {
-                                // single line longer than the buffer: grow
-                                byte[] nb = new byte[buf.Length * 2];
-                                Array.Copy(buf, nb, end);
-                                buf = nb;
-                                fill = end;
-                                continue;
-                            }
-                            // emit complete lines
-                            foreach (ArraySegment<byte> seg in parts)
-                            {
-                                if (lineIdx++ < pos.LineIdx) continue;
-                                pos.LineIdx = lineIdx - 1;
-                                Dictionary<string, string> emitted = new Dictionary<string, string>();
-                                foreach (Candidate cand in DecodeAndMutate(buf, seg, encs, emitted))
-                                    yield return cand;
-                            }
-                            if (eof)
-                            {
-                                int len = keep;
-                                if (len > 0 && buf[start + len - 1] == 0x0D) len--;
-                                if (len > 0)
-                                {
-                                    if (lineIdx++ < pos.LineIdx) { }
-                                    else
-                                    {
-                                        pos.LineIdx = lineIdx - 1;
-                                        Dictionary<string, string> emitted = new Dictionary<string, string>();
-                                        ArraySegment<byte> seg = new ArraySegment<byte>(buf, start, len);
-                                        foreach (Candidate cand in DecodeAndMutate(buf, seg, encs, emitted))
-                                            yield return cand;
-                                    }
-                                }
-                                yield break;
-                            }
-                            // move the partial line to the front and refill
-                            Array.Copy(buf, start, buf, 0, keep);
-                            fill = keep;
+                            if (rl.Index < pos.LineIdx) continue;
+                            pos.LineIdx = rl.Index;
+                            emitted.Clear();
+                            foreach (Candidate cand in DecodeAndMutate(rl.Buf, rl.Offset, rl.Count, encs, emitted))
+                                yield return cand;
                         }
                     }
                 }
@@ -362,32 +416,48 @@ namespace DictCrack
             }
         }
 
-        private IEnumerable<Candidate> DecodeAndMutate(byte[] buf, ArraySegment<byte> seg, List<Encoding> encs, Dictionary<string, string> emitted)
+        private IEnumerable<Candidate> DecodeAndMutate(byte[] buf, int offset, int count, List<Encoding> encs, Dictionary<string, string> emitted)
         {
+            // decode the line under every planned encoding (the encoding
+            // sweep), skipping duplicates within the line
             for (int i = 0; i < encs.Count; i++)
             {
                 string s;
-                try { s = encs[i].GetString(buf, seg.Offset, seg.Count); }
+                try { s = encs[i].GetString(buf, offset, count); }
                 catch { s = null; }
                 if (s == null) continue;
                 string t = Sanitize(s);
-                if (t != null && !emitted.ContainsKey(t))
+                if (t != null && !emitted.ContainsKey(t) && (_global == null || _global.Add(t)))
                 {
                     string tag = DictEncoding.EncLabel(encs[i]);
                     emitted[t] = tag;
                     yield return new Candidate(t, tag);
                 }
             }
-            // mutations keep the tag of the base word they mutate
-            List<KeyValuePair<string, string>> bases = new List<KeyValuePair<string, string>>(emitted);
-            foreach (KeyValuePair<string, string> kv in bases)
-                foreach (string preset in _presets)
-                    foreach (string m in Rules.Apply(preset, kv.Key))
-                        if (!emitted.ContainsKey(m))
+            // chained mutations: each preset also mutates the outputs of
+            // the presets before it (word -> word+year -> word+year+digits)
+            if (_presets.Count > 0)
+            {
+                List<KeyValuePair<string, string>> frontier = new List<KeyValuePair<string, string>>(emitted);
+                for (int pi = 0; pi < _presets.Count; pi++)
+                {
+                    if (emitted.Count >= MutationCap) yield break;
+                    List<KeyValuePair<string, string>> next = new List<KeyValuePair<string, string>>();
+                    foreach (KeyValuePair<string, string> kv in frontier)
+                    {
+                        foreach (string m in Rules.Apply(_presets[pi], kv.Key))
                         {
-                            emitted[m] = kv.Value;
+                            if (emitted.ContainsKey(m)) continue;
+                            if (_global != null && !_global.Add(m)) continue;
+                            if (emitted.Count >= MutationCap) yield break;
+                            emitted[m] = kv.Value;   // mutations keep the tag of the base word
+                            next.Add(new KeyValuePair<string, string>(m, kv.Value));
                             yield return new Candidate(m, kv.Value);
                         }
+                    }
+                    frontier = next;
+                }
+            }
         }
 
         private static string Sanitize(string s)
@@ -575,17 +645,27 @@ namespace DictCrack
 
         public CombinatorSource(string fileA, string fileB) { _fileA = fileA; _fileB = fileB; }
 
+        // B is fully loaded: every line under every planned encoding,
+        // deduped globally (the same encoding sweep the dictionary source
+        // uses - the old behavior read a UTF-8 B as GBK mojibake)
         private List<string> LoadB()
         {
             if (_bLines != null) return _bLines;
+            List<string> lines = new List<string>(1 << 16);
+            HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
             string note;
             List<Encoding> encs = DictEncoding.Plan(_fileB, out note);
-            Encoding e = encs[encs.Count - 1]; // encoding sweep on B: use ANSI fallback for combinator
-            List<string> lines = new List<string>(1 << 16);
-            foreach (string l in File.ReadLines(_fileB, e))
+            foreach (Encoding e in encs)
             {
-                string t = Sanitize(l);
-                if (t != null) lines.Add(t);
+                try
+                {
+                    foreach (string l in File.ReadLines(_fileB, e))
+                    {
+                        string t = Sanitize(l);
+                        if (t != null && seen.Add(t)) lines.Add(t);
+                    }
+                }
+                catch { }   // a strict encoding may reject foreign bytes; the next planned encoding still runs
             }
             _bLines = lines;
             return lines;
@@ -595,6 +675,8 @@ namespace DictCrack
         {
             get
             {
+                // approximate: A's encoding-sweep variants per raw line are
+                // content-dependent, so a*x can only underestimate
                 if (_countTotal < 0)
                 {
                     long a = CountSafe(_fileA), b = LoadB().Count;
@@ -613,28 +695,75 @@ namespace DictCrack
         public IEnumerable<Candidate> Enumerate(SourcePosition pos, System.Threading.CancellationToken ct)
         {
             List<string> b = LoadB();
-            string note;
-            List<Encoding> encs = DictEncoding.Plan(_fileA, out note);
-            Encoding e = encs[encs.Count - 1];
-            long idxA = 0, idxB = 0;
-            if (pos.IdxA > 0) { idxA = pos.IdxA; }
-            if (pos.IdxA == idxA) idxB = pos.IdxB;
-            foreach (string la in File.ReadLines(_fileA, e))
+            string note; long bomSkip;
+            List<Encoding> encs;
+            using (Stream probe = File.OpenRead(_fileA))
             {
-                if (ct.IsCancellationRequested) yield break;
-                string ta = Sanitize(la);
-                if (ta == null) continue;
-                if (idxA < pos.IdxA) { idxA++; continue; }
-                pos.IdxA = idxA;
-                for (; idxB < b.Count; idxB++)
+                encs = DictEncoding.Plan(probe, out note, out bomSkip);
+            }
+            long savedA = pos.IdxA, savedB = pos.IdxB;
+            // savedB applies to the FIRST variant of the resume line only;
+            // later variants restart from 0 (re-trying candidates is safe,
+            // skipping them would miss passwords)
+            bool bResumePending = true;
+            Dictionary<string, string> variants = new Dictionary<string, string>(8);
+
+            bool utf16A = encs.Count == 1 && (encs[0].CodePage == 1200 || encs[0].CodePage == 1201);
+            if (utf16A)
+            {
+                using (StreamReader sr = new StreamReader(_fileA, encs[0]))
                 {
-                    if (ct.IsCancellationRequested) yield break;
-                    pos.IdxB = idxB;
-                    yield return new Candidate(ta + b[(int)idxB], "");
+                    string line; long idxA = 0;
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        if (ct.IsCancellationRequested) yield break;
+                        if (idxA < savedA) { idxA++; continue; }
+                        pos.IdxA = idxA;
+                        string ta = Sanitize(line);
+                        idxA++;
+                        if (ta == null) continue;
+                        long startB = (bResumePending && pos.IdxA == savedA) ? savedB : 0;
+                        if (pos.IdxA == savedA) bResumePending = false;
+                        for (long ib = startB; ib < b.Count; ib++)
+                        {
+                            if (ct.IsCancellationRequested) yield break;
+                            pos.IdxB = ib;
+                            yield return new Candidate(ta + b[(int)ib], "");
+                        }
+                        pos.IdxB = 0;
+                    }
                 }
-                idxB = 0;
-                pos.IdxB = 0;
-                idxA++;
+            }
+            else
+            {
+                using (Stream fs = File.OpenRead(_fileA))
+                {
+                    foreach (RawLine rl in RawLines.Enumerate(fs, bomSkip, ct))
+                    {
+                        if (rl.Index < savedA) continue;
+                        pos.IdxA = rl.Index;
+                        // encoding sweep on A with per-line dedup
+                        variants.Clear();
+                        for (int e = 0; e < encs.Count; e++)
+                        {
+                            string s;
+                            try { s = encs[e].GetString(rl.Buf, rl.Offset, rl.Count); }
+                            catch { continue; }
+                            string ta = Sanitize(s);
+                            if (ta == null || variants.ContainsKey(ta)) continue;
+                            variants[ta] = "";
+                            long startB = (bResumePending && rl.Index == savedA) ? savedB : 0;
+                            if (rl.Index == savedA) bResumePending = false;
+                            for (long ib = startB; ib < b.Count; ib++)
+                            {
+                                if (ct.IsCancellationRequested) yield break;
+                                pos.IdxB = ib;
+                                yield return new Candidate(ta + b[(int)ib], "");
+                            }
+                            pos.IdxB = 0;
+                        }
+                    }
+                }
             }
         }
 

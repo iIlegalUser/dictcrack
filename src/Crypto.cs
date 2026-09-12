@@ -24,24 +24,11 @@ namespace DictCrack
         private const uint BCRYPT_ALG_HANDLE_HMAC_FLAG = 0x00000008;
         private const int STATUS_SUCCESS = 0;
 
-        private static IntPtr _sha256Hmac = IntPtr.Zero;
-        private static IntPtr _sha1Hmac = IntPtr.Zero;
         private static bool _initFailed;
-
-        private static IntPtr GetAlg(ref IntPtr cached, string algId)
-        {
-            if (cached != IntPtr.Zero) return cached;
-            IntPtr h;
-            int st = BCryptOpenAlgorithmProvider(out h, algId, null, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-            if (st != STATUS_SUCCESS) { _initFailed = true; return IntPtr.Zero; }
-            cached = h;
-            return h;
-        }
 
         // CNG serializes PBKDF2 calls that share one algorithm handle
         // (measured: throughput plateaus at ~4 threads). One handle per
-        // thread restores linear scaling, so callers cache handles per
-        // thread; GetThreadAlg falls back to the shared handle otherwise.
+        // thread restores linear scaling, so handles are cached per thread.
         [ThreadStatic]
         private static IntPtr _tlsSha256;
         [ThreadStatic]
@@ -57,9 +44,9 @@ namespace DictCrack
             return h;
         }
 
-        private static byte[] Pbkdf2Cng(string algId, ref IntPtr cached, byte[] pwd, byte[] salt, long iterations, int bytes)
+        private static byte[] Pbkdf2Cng(bool sha256, byte[] pwd, byte[] salt, long iterations, int bytes)
         {
-            IntPtr h = GetThreadAlg(algId == "SHA256");
+            IntPtr h = GetThreadAlg(sha256);
             if (h == IntPtr.Zero) return null;
             byte[] outBuf = new byte[bytes];
             int st = BCryptDeriveKeyPBKDF2(h, pwd, (uint)pwd.Length, salt, (uint)salt.Length,
@@ -67,15 +54,16 @@ namespace DictCrack
             return st == STATUS_SUCCESS ? outBuf : null;
         }
 
-        // PBKDF2 with the requested hash; falls back to the managed
-        // implementation when CNG is unavailable for some reason.
+        // PBKDF2 with the requested hash. Only a failed HANDLE OPEN makes
+        // the managed fallback permanent; a failed derive call is transient
+        // (previously any single failure downgraded the whole run to the
+        // several-times-slower managed implementation).
         public static byte[] Pbkdf2Sha256(byte[] pwd, byte[] salt, long iterations, int bytes)
         {
             if (!_initFailed)
             {
-                byte[] r = Pbkdf2Cng("SHA256", ref _sha256Hmac, pwd, salt, iterations, bytes);
+                byte[] r = Pbkdf2Cng(true, pwd, salt, iterations, bytes);
                 if (r != null) return r;
-                _initFailed = true;
             }
             using (var d = new Rfc2898DeriveBytes(pwd, salt, (int)Math.Min(iterations, int.MaxValue - 1), HashAlgorithmName.SHA256))
                 return d.GetBytes(bytes);
@@ -85,9 +73,8 @@ namespace DictCrack
         {
             if (!_initFailed)
             {
-                byte[] r = Pbkdf2Cng("SHA1", ref _sha1Hmac, pwd, salt, iterations, bytes);
+                byte[] r = Pbkdf2Cng(false, pwd, salt, iterations, bytes);
                 if (r != null) return r;
-                _initFailed = true;
             }
             using (var d = new Rfc2898DeriveBytes(pwd, salt, (int)Math.Min(iterations, int.MaxValue - 1), HashAlgorithmName.SHA1))
                 return d.GetBytes(bytes);

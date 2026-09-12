@@ -52,6 +52,18 @@ namespace DictCrack
 
     internal static class ArchiveParser
     {
+        // hashcat -m 13000 format for RAR5:
+        // $rar5$<saltlen>$<salt hex>$<lg2cnt>$<pswcheck hex>$<pswchecklen>
+        internal static string HashcatRar5(Rar5CryptInfo ci)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder("$rar5$16$");
+            foreach (byte b in ci.Salt) sb.Append(b.ToString("x2"));
+            sb.Append('$').Append(ci.Lg2Count).Append('$');
+            foreach (byte b in ci.PswCheck) sb.Append(b.ToString("x2"));
+            sb.Append("$8");
+            return sb.ToString();
+        }
+
         public static ArchiveInfo Parse(string path)
         {
             ArchiveInfo info = new ArchiveInfo();
@@ -285,14 +297,46 @@ namespace DictCrack
                 }
                 if (eocd < 0) return null;
                 ushort entryCount = BitConverter.ToUInt16(tail, eocd + 10);
-                uint cdSize = BitConverter.ToUInt32(tail, eocd + 12);
+                long cdSize = BitConverter.ToUInt32(tail, eocd + 12);
                 // the EOCD stores absolute offsets; subtract what lies before
                 // them so archives with a prepended stub (SFX) still parse
                 long eocdFilePos = tailStart + eocd;
                 long cdOffset = BitConverter.ToUInt32(tail, eocd + 16);
-                long baseOffset = eocdFilePos - (long)(cdSize + cdOffset);
-                if (baseOffset < 0) baseOffset = 0;
-                cdOffset += baseOffset;
+                // ZIP64: a locator (PK\x06\x07) sits 20 bytes before the EOCD
+                // when the classic fields overflowed; the real 64-bit values
+                // live in the ZIP64 EOCD record (PK\x06\x06)
+                bool usedZip64Eocd = false;
+                if (eocd >= 20 && tail[eocd - 20] == 0x50 && tail[eocd - 19] == 0x4B
+                    && tail[eocd - 18] == 0x06 && tail[eocd - 17] == 0x07)
+                {
+                    long z64Pos = BitConverter.ToInt64(tail, eocd - 20 + 8);
+                    if (z64Pos >= 0 && z64Pos + 56 <= fs.Length)
+                    {
+                        byte[] z64 = new byte[56];
+                        fs.Seek(z64Pos, SeekOrigin.Begin);
+                        if (ReadFull(fs, z64) == 56 && z64[0] == 0x50 && z64[1] == 0x4B && z64[2] == 0x06 && z64[3] == 0x06)
+                        {
+                            long entries64 = BitConverter.ToInt64(z64, 32);
+                            long cdSize64 = BitConverter.ToInt64(z64, 40);
+                            long cdOffset64 = BitConverter.ToInt64(z64, 48);
+                            if (entryCount == 0xFFFF) entryCount = (ushort)Math.Min(entries64, int.MaxValue);
+                            if (cdSize == 0xFFFFFFFF) cdSize = cdSize64;
+                            if (cdOffset == 0xFFFFFFFF) cdOffset = cdOffset64;
+                            usedZip64Eocd = cdSize64 > 0 || cdOffset64 > 0;
+                        }
+                    }
+                }
+                long baseOffset = 0;
+                if (!usedZip64Eocd)
+                {
+                    baseOffset = eocdFilePos - (cdSize + cdOffset);
+                    if (baseOffset < 0) baseOffset = 0;
+                    cdOffset += baseOffset;
+                }
+                // with ZIP64 the record's cdOffset/local offsets are already
+                // absolute file offsets: the classic baseOffset formula
+                // cannot account for the ZIP64 records sitting between the
+                // central directory and the EOCD
 
                 ZipTargetInfo best = null;
                 long pos = cdOffset;
@@ -307,6 +351,7 @@ namespace DictCrack
                     ushort method = BitConverter.ToUInt16(cde, 10);
                     ushort dostime = BitConverter.ToUInt16(cde, 12);
                     uint crc = BitConverter.ToUInt32(cde, 16);
+                    uint uncompSize = BitConverter.ToUInt32(cde, 24);
                     uint compSize = BitConverter.ToUInt32(cde, 20);
                     ushort nameLen = BitConverter.ToUInt16(cde, 28);
                     ushort extraLen = BitConverter.ToUInt16(cde, 30);
@@ -318,10 +363,23 @@ namespace DictCrack
                     if (extraLen > 0 && ReadFull(fs, extraBuf) != extraLen) break;
                     string name = System.Text.Encoding.UTF8.GetString(nameBuf);
 
-                    if ((flags & 0x0001) != 0 && compSize > 0)
+                    // ZIP64: sentinel 0xFFFFFFFF fields are stored in the
+                    // extra field 0x0001, in fixed order (uncomp, comp,
+                    // local offset, disk start) - only present ones appear
+                    long compL = compSize == 0xFFFFFFFFu ? -1L : compSize;
+                    long localOffL = localOffset == 0xFFFFFFFFu ? -1L : localOffset;
+                    if (uncompSize == 0xFFFFFFFFu || compL < 0 || localOffL < 0)
                     {
-                        ZipTargetInfo cand = BuildZipTarget(path, baseOffset + localOffset, nameLen, extraLen, flags, method,
-                            dostime, crc, compSize, name, extraBuf);
+                        long uncompL = uncompSize == 0xFFFFFFFFu ? -1L : uncompSize;
+                        ParseZip64Extra(extraBuf, ref uncompL, ref compL, ref localOffL);
+                        if (compL < 0) compL = 0;
+                        if (localOffL < 0) localOffL = localOffset;
+                    }
+
+                    if ((flags & 0x0001) != 0 && compL > 0)
+                    {
+                        ZipTargetInfo cand = BuildZipTarget(path, baseOffset + localOffL, nameLen, extraLen, flags, method,
+                            dostime, crc, compL, name, extraBuf);
                         if (cand != null && IsBetter(cand, best)) best = cand;
                     }
                     pos += 46 + nameLen + extraLen + commentLen;
@@ -340,8 +398,31 @@ namespace DictCrack
             return cand.CompDataSize < best.CompDataSize;
         }
 
+        // ZIP64 extra field 0x0001: 8-byte values in fixed order (original
+        // size, compressed size, local header offset, disk start number);
+        // a value appears only when its central-directory slot is 0xFFFFFFFF
+        private static void ParseZip64Extra(byte[] extra, ref long uncomp, ref long comp, ref long localOff)
+        {
+            int i = 0;
+            while (i + 4 <= extra.Length)
+            {
+                ushort id = BitConverter.ToUInt16(extra, i);
+                ushort sz = BitConverter.ToUInt16(extra, i + 2);
+                if (id == 0x0001)
+                {
+                    int p = i + 4;
+                    int end = i + 4 + sz;
+                    if (uncomp < 0 && p + 8 <= end) { uncomp = BitConverter.ToInt64(extra, p); p += 8; }
+                    if (comp < 0 && p + 8 <= end) { comp = BitConverter.ToInt64(extra, p); p += 8; }
+                    if (localOff < 0 && p + 8 <= end) { localOff = BitConverter.ToInt64(extra, p); p += 8; }
+                    return;
+                }
+                i += 4 + sz;
+            }
+        }
+
         private static ZipTargetInfo BuildZipTarget(string path, long localOffset, int centralNameLen,
-            int centralExtraLen, ushort flags, ushort method, ushort dostime, uint crc, uint compSize,
+            int centralExtraLen, ushort flags, ushort method, ushort dostime, uint crc, long compSize,
             string name, byte[] centralExtra)
         {
             try

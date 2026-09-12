@@ -488,7 +488,14 @@ namespace DictCrack
             {
                 if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; RequestCancel(); }
             };
-            FormClosing += delegate(object s, FormClosingEventArgs e) { RequestCancel(); };
+            FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                RequestCancel();
+                // the engine writes its final session (checkpoint) after the
+                // workers join; give it a moment so closing mid-run does not
+                // silently drop the last checkpoint
+                try { if (_workThread != null && _workThread.IsAlive) _workThread.Join(2000); } catch { }
+            };
             Shown += delegate(object s, EventArgs e) { MinimumSize = Size; };
 
             AllowDrop = true;
@@ -724,7 +731,7 @@ namespace DictCrack
             if (chkResume.Checked)
             {
                 SessionState sess = SessionState.Load(CrackEngine.SessionPath);
-                if (sess != null && sess.Matches(Path.GetFullPath(cfg.ArchivePath), cfg.ParamsHash()))
+                if (sess != null && sess.Matches(Path.GetFullPath(cfg.ArchivePath), cfg.ParamsHash(), CrackEngine.DictFingerprint(cfg)))
                 {
                     DialogResult dr = MessageBox.Show(this,
                         "检测到上次未完成的会话（" + sess.SaveTimeText + "，已试 " + sess.TriedAll + " 个）。\n\n从上次进度继续吗？\n\n是 = 续跑；否 = 从头开始。", "DictCrack",
@@ -843,10 +850,12 @@ namespace DictCrack
             }
         }
 
-        // rewrite the dictionary with the hit password at line 1. The
-        // encoding is rediscovered by locating the hit line: whichever
-        // planned encoding decodes a line equal to the password wins, so
-        // GBK/UTF-8/UTF-16 dictionaries are all preserved byte-faithfully.
+        // rewrite the dictionary with the hit password at line 1, streaming
+        // line by line so a multi-hundred-MB dictionary is not loaded into
+        // memory. The encoding is rediscovered by locating the hit line:
+        // whichever planned encoding decodes a line equal to the password
+        // wins, so GBK/UTF-8/UTF-16 dictionaries are all preserved
+        // byte-faithfully.
         private static void MovePasswordToTop(string dictPath, string pwdLine)
         {
             string note;
@@ -864,15 +873,31 @@ namespace DictCrack
             }
             if (chosen == null) chosen = encs[encs.Count - 1];
             Encoding save = DictEncoding.SaveEncoding(chosen);
-            List<string> lines = new List<string>(File.ReadAllLines(dictPath, save));
-            lines.RemoveAll(delegate(string l) { return l == pwdLine; });
-            lines.Insert(0, pwdLine);
             string tmp = dictPath + ".tmp";
-            File.WriteAllLines(tmp, lines.ToArray(), save);
             bool done = false;
             string errs = "";
-            try { File.Replace(tmp, dictPath, null); done = true; }
-            catch (Exception ex) { errs = "Replace: " + ex.Message; }
+            try
+            {
+                using (StreamReader sr = new StreamReader(dictPath, save))
+                using (StreamWriter sw = new StreamWriter(tmp, false, save))
+                {
+                    sw.WriteLine(pwdLine);
+                    string line;
+                    while ((line = sr.ReadLine()) != null)
+                        if (line != pwdLine) sw.WriteLine(line);
+                }
+                done = true;
+            }
+            catch (Exception ex) { errs = "write: " + ex.Message; }
+            if (done)
+            {
+                try { File.Replace(tmp, dictPath, null); }
+                catch (Exception ex)
+                {
+                    errs = "Replace: " + ex.Message;
+                    done = false;
+                }
+            }
             if (!done)
             {
                 try { File.Copy(tmp, dictPath, true); done = true; }
@@ -952,7 +977,7 @@ namespace DictCrack
             try
             {
                 EngineStats st = _engine.Stats;
-                long triedAllNow = st.Tried;
+                long triedAllNow = st.Tried + st.BaseTried;
 
                 if (_rateTick.Elapsed.TotalSeconds >= 0.5)
                 {

@@ -58,6 +58,47 @@ namespace DictCrack
 
         public ZipVerifier(ZipTargetInfo t) { _t = t; }
 
+        // in-memory cache of the encrypted entry bytes: the confirm path
+        // runs on every false-positive PV hit (1/256 for ZipCrypto, 1/65536
+        // for AES), and at high thread counts reopening the file each time
+        // dominated I/O. Guarded by a size cap so a multi-GB entry is not
+        // swallowed; an uncached entry falls back to the file path.
+        private static string _cachePath;
+        private static byte[] _cacheData;
+        private static readonly object _cacheLock = new object();
+        private const long MaxCacheBytes = 64L << 20;
+
+        // call before every run: switches the cache to a new archive
+        public static void ResetCache(string archivePath)
+        {
+            ArchivePath = archivePath;
+            lock (_cacheLock) { _cachePath = null; _cacheData = null; }
+        }
+
+        private byte[] GetEntryData()
+        {
+            if (_t.CompDataSize > MaxCacheBytes) return null;
+            byte[] d = _cacheData;
+            if (d != null && _cachePath == ArchivePath) return d;
+            lock (_cacheLock)
+            {
+                if (_cacheData != null && _cachePath == ArchivePath) return _cacheData;
+                try
+                {
+                    using (FileStream fs = new FileStream(ArchivePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16))
+                    {
+                        fs.Seek(_t.DataStart, SeekOrigin.Begin);
+                        byte[] buf = new byte[_t.CompDataSize];
+                        if (ArchiveParser.ReadFull(fs, buf) != buf.Length) return null;
+                        _cacheData = buf;
+                        _cachePath = ArchivePath;
+                        return buf;
+                    }
+                }
+                catch { return null; }
+            }
+        }
+
         public override bool Native { get { return true; } }
 
         public override string Describe()
@@ -90,28 +131,39 @@ namespace DictCrack
             if (derived[2 * keyLen] != storedPv[0] || derived[2 * keyLen + 1] != storedPv[1]) return false;
             byte[] macKey = new byte[keyLen];
             Array.Copy(derived, keyLen, macKey, 0, keyLen);
+            byte[] mac;
             try
             {
                 using (HMACSHA1 hmac = new HMACSHA1(macKey))
-                using (FileStream fs = new FileStream(ArchivePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16))
                 {
-                    fs.Seek(_t.DataStart, SeekOrigin.Begin);
-                    byte[] buf = new byte[1 << 16];
-                    long left = _t.CompDataSize;
-                    while (left > 0)
+                    byte[] data = GetEntryData();
+                    if (data != null)
                     {
-                        int n = fs.Read(buf, 0, (int)Math.Min((long)buf.Length, left));
-                        if (n <= 0) return false;
-                        hmac.TransformBlock(buf, 0, n, null, 0);
-                        left -= n;
+                        mac = hmac.ComputeHash(data);
                     }
-                    hmac.TransformFinalBlock(new byte[0], 0, 0);
-                    byte[] mac = hmac.Hash;
-                    for (int i = 0; i < 10; i++) if (mac[i] != _t.Mac[i]) return false;
+                    else
+                    {
+                        using (FileStream fs = new FileStream(ArchivePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16))
+                        {
+                            fs.Seek(_t.DataStart, SeekOrigin.Begin);
+                            byte[] buf = new byte[1 << 16];
+                            long left = _t.CompDataSize;
+                            while (left > 0)
+                            {
+                                int n = fs.Read(buf, 0, (int)Math.Min((long)buf.Length, left));
+                                if (n <= 0) return false;
+                                hmac.TransformBlock(buf, 0, n, null, 0);
+                                left -= n;
+                            }
+                            hmac.TransformFinalBlock(new byte[0], 0, 0);
+                            mac = hmac.Hash;
+                        }
+                    }
                 }
             }
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
+            for (int i = 0; i < 10; i++) if (mac[i] != _t.Mac[i]) return false;
             return true;
         }
 
@@ -131,12 +183,34 @@ namespace DictCrack
         {
             try
             {
+                uint crc;
+                byte[] data = GetEntryData();
+                if (data != null)
+                {
+                    byte[] plain = new byte[data.Length];
+                    for (int i = 0; i < data.Length; i++) plain[i] = st.DecryptByte(data[i]);
+                    using (MemoryStream ms = new MemoryStream(plain))
+                    {
+                        if (_t.Method == 8)
+                        {
+                            using (DeflateStream ds = new DeflateStream(ms, CompressionMode.Decompress))
+                            {
+                                crc = PumpCrc(ds);
+                            }
+                        }
+                        else
+                        {
+                            crc = PumpCrc(ms);
+                        }
+                    }
+                    return crc == _t.Crc32;
+                }
+                // entry too large / unreadable for the cache: stream it
                 using (FileStream fs = new FileStream(ArchivePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16))
                 {
                     fs.Seek(_t.DataStart, SeekOrigin.Begin);
                     using (ZcStream zs = new ZcStream(fs, st, _t.CompDataSize))
                     {
-                        uint crc;
                         if (_t.Method == 8)
                         {
                             using (DeflateStream ds = new DeflateStream(zs, CompressionMode.Decompress))
@@ -148,8 +222,8 @@ namespace DictCrack
                         {
                             crc = PumpCrc(zs);
                         }
-                        return crc == _t.Crc32;
                     }
+                    return crc == _t.Crc32;
                 }
             }
             catch (InvalidDataException) { return false; }   // garbage deflate
@@ -289,7 +363,7 @@ namespace DictCrack
             if (!string.IsNullOrEmpty(archivePath))
             {
                 string full = Path.GetFullPath(archivePath);
-                ZipVerifier.ArchivePath = full;
+                ZipVerifier.ResetCache(full);   // ArchivePath + drop stale entry cache
                 SpawnVerifier.ArchivePath = full;
             }
             if (info.Kind == ArchiveKind.Rar5 && info.NativeSupported)
@@ -310,6 +384,10 @@ namespace DictCrack
         // never need it
         public static string FindExtractor()
         {
+            // explicit override wins; keep machine-specific defaults out of
+            // the source for other people's machines
+            string env = Environment.GetEnvironmentVariable("DICTCRACK_TOOL");
+            if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
             string[] candidates = new string[]
             {
                 "D:\\Software\\Scoop\\shims\\7z.exe",
