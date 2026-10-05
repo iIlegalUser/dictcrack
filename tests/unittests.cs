@@ -53,11 +53,16 @@ namespace DictCrack
             TestSessionFingerprint();
             TestRules();
             TestDictionarySource();
+            TestUtf16Rules();
             TestMaskSource();
             TestRawLines();
             TestEncodingPlan();
             TestZip64();
+            TestZip64ManyEntries();
             TestHashcatFormat();
+            TestResultEncoding();
+            TestWinArgQuote();
+            TestRar5Truncation();
             Console.WriteLine(_fail == 0 ? "ALL PASS" : ("FAILURES: " + _fail));
             return _fail;
         }
@@ -371,16 +376,206 @@ namespace DictCrack
             return ms.ToArray();
         }
 
-        private static void TestHashcatFormat()
-        {
-            Console.WriteLine("unit: hashcat -m 13000 format");
-            Rar5CryptInfo ci = new Rar5CryptInfo();
-            ci.Salt = new byte[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
-            ci.PswCheck = new byte[] { 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7 };
-            ci.Lg2Count = 15;
-            Check("hashcat rar5",
-                ArchiveParser.HashcatRar5(ci)
-                == "$rar5$16$000102030405060708090a0b0c0d0e0f$15$a0a1a2a3a4a5a6a7$8");
-        }
+    private static void TestHashcatFormat()
+    {
+        Console.WriteLine("unit: hashcat -m 13000 format");
+        Rar5CryptInfo ci = new Rar5CryptInfo();
+        ci.Salt = new byte[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        ci.PswCheck = new byte[] { 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7 };
+        ci.Lg2Count = 15;
+        Check("hashcat rar5",
+            ArchiveParser.HashcatRar5(ci)
+            == "$rar5$16$000102030405060708090a0b0c0d0e0f$15$a0a1a2a3a4a5a6a7$8");
     }
+
+    // ----------------------------------------------------------------
+    // ZIP64 with more than 65535 entries: the classic EOCD count field
+    // holds 0xFFFF and the real count lives in the ZIP64 EOCD record.
+    // Regression: the count used to be truncated to ushort, so a 65536-
+    // entry archive parsed as 0 entries and the encrypted entry was lost.
+    private static void TestZip64ManyEntries()
+    {
+        Console.WriteLine("unit: ZIP64 archive with 65536 entries");
+        string dir = TempDir();
+        try
+        {
+            string p = Path.Combine(dir, "many.zip");
+            File.WriteAllBytes(p, BuildZip64ManyEntries(65536));
+            ArchiveInfo info = ArchiveParser.Parse(p);
+            Check("many-entry zip64 detected", info.Kind == ArchiveKind.Zip);
+            Check("encrypted entry found despite 65536 entries", info.Zip != null);
+            if (info.Zip != null)
+            {
+                Check("many-entry target name", info.Zip.Name == "e");
+                Check("many-entry comp size", info.Zip.CompDataSize == 88);
+            }
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    // minimal ZIP64 chain whose central directory holds n records; only
+    // the LAST record is encrypted (flags bit0) and has a real local
+    // header, the rest are 47-byte stubs the parser merely walks past
+    private static byte[] BuildZip64ManyEntries(int n)
+    {
+        MemoryStream ms = new MemoryStream();
+        BinaryWriter w = new BinaryWriter(ms);
+        w.Write((uint)0x04034b50);            // local header of the target
+        w.Write((ushort)20);
+        w.Write((ushort)0x0001);              // encrypted
+        w.Write((ushort)8);                   // deflate
+        w.Write((ushort)0); w.Write((ushort)0x5A00);
+        w.Write((uint)0x12345678);            // crc
+        w.Write((uint)100); w.Write((uint)100);
+        w.Write((ushort)1); w.Write((ushort)0);
+        w.Write((byte)'e');
+        w.Write(new byte[12 + 100]);          // 12-byte enc header + payload (contents not verified)
+        long cdOffset = ms.Length;
+        for (int i = 0; i < n; i++)
+        {
+            bool last = i == n - 1;
+            w.Write((uint)0x02014b50);        // central directory record
+            w.Write((ushort)20); w.Write((ushort)20);
+            w.Write((ushort)(last ? 0x0001 : 0));
+            w.Write((ushort)8);
+            w.Write((ushort)0); w.Write((ushort)0x5A00);
+            w.Write((uint)0x12345678);
+            w.Write((uint)100); w.Write((uint)100);
+            w.Write((ushort)1); w.Write((ushort)0); w.Write((ushort)0);
+            w.Write((ushort)0); w.Write((ushort)0); w.Write((uint)0);
+            w.Write(0u);                      // local offset (only 'last' is opened)
+            w.Write((byte)(last ? (byte)'e' : (byte)'x'));
+        }
+        long cdSize = ms.Length - cdOffset;
+        long z64Pos = ms.Length;
+        w.Write((uint)0x06064b50);            // ZIP64 EOCD: real entry count
+        w.Write((ulong)44);
+        w.Write((ushort)45); w.Write((ushort)45);
+        w.Write((uint)0); w.Write((uint)0);
+        w.Write((ulong)n); w.Write((ulong)n);
+        w.Write((ulong)cdSize); w.Write((ulong)cdOffset);
+        w.Write((uint)0x07064b50);            // ZIP64 locator
+        w.Write((uint)0);
+        w.Write((ulong)z64Pos);
+        w.Write((uint)1);
+        w.Write((uint)0x06054b50);            // EOCD with 0xFFFF sentinels
+        w.Write((ushort)0xFFFF); w.Write((ushort)0xFFFF); w.Write((ushort)0xFFFF);
+        w.Write((ushort)0xFFFF);
+        w.Write((uint)0xFFFFFFFF); w.Write((uint)0xFFFFFFFF);
+        w.Write((ushort)0);
+        return ms.ToArray();
+    }
+
+    // ----------------------------------------------------------------
+    // UTF-16LE dictionaries are split with StreamReader (0x0A can occur
+    // inside a UTF-16 unit pair); regression: that path skipped the
+    // mutation presets entirely, so rules silently never applied.
+    private static void TestUtf16Rules()
+    {
+        Console.WriteLine("unit: UTF-16 dictionary runs mutation presets");
+        string dir = TempDir();
+        try
+        {
+            string p = Path.Combine(dir, "u16.txt");
+            File.WriteAllBytes(p, new byte[] { 0xFF, 0xFE }.Concat(Encoding.Unicode.GetBytes("foo\r\n")).ToArray());
+            DictionarySource src = new DictionarySource(new List<string> { p }, new List<string> { "digits" });
+            List<string> got = new List<string>();
+            foreach (Candidate c in src.Enumerate(new SourcePosition(), CancellationToken.None)) got.Add(c.Pw);
+            Check("utf16 base word first", got.Count > 0 && got[0] == "foo");
+            Check("utf16 single-digit suffix", got.Contains("foo0"));
+            Check("utf16 double-digit suffix", got.Contains("foo99"));
+            Check("utf16 fan-out 111", got.Count == 111);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    // ----------------------------------------------------------------
+    // result file encoding: GBK when lossless, UTF-8 BOM otherwise.
+    // Regression: the old byte-level roundtrip check could not catch
+    // chars GBK best-fits to '?' (emoji, rare CJK) - such passwords were
+    // silently corrupted in the result file.
+    private static void TestResultEncoding()
+    {
+        Console.WriteLine("unit: result file encoding policy");
+        string dir = TempDir();
+        try
+        {
+            // char outside GBK must fall back to UTF-8 with BOM
+            string p = Path.Combine(dir, "res-emoji.txt");
+            string pw = "pw\U0001F600x";
+            CrackEngine.WriteResultText(p, pw);
+            Check("non-GBK password roundtrips", File.ReadAllText(p, Encoding.UTF8).Trim() == pw);
+            byte[] head = new byte[3];
+            using (FileStream fs = File.OpenRead(p)) { fs.Read(head, 0, 3); }
+            Check("non-GBK written as UTF-8 BOM", head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF);
+
+            // GBK-representable password stays GBK (no BOM prepended)
+            string p2 = Path.Combine(dir, "res-gbk.txt");
+            CrackEngine.WriteResultText(p2, "\u5bc6\u7801123");
+            using (FileStream fs = File.OpenRead(p2)) { fs.Read(head, 0, 3); }
+            bool bom = head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF;
+            Check("GBK password stays GBK", !bom
+                && File.ReadAllText(p2, Encoding.GetEncoding(936)).Trim() == "\u5bc6\u7801123");
+
+            // trailing backslash is GBK-representable and must survive
+            string p3 = Path.Combine(dir, "res-bs.txt");
+            CrackEngine.WriteResultText(p3, "abc\\");
+            Check("trailing backslash roundtrips", File.ReadAllText(p3, Encoding.GetEncoding(936)).Trim() == "abc\\");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    // ----------------------------------------------------------------
+    // argument quoting for the 7z/rar spawn path. The two tool families
+    // parse command lines differently (both verified by round-tripping
+    // real passwords through the real executables):
+    //   - 7z.exe self-parses the raw command line: backslashes are always
+    //     literal, "" collapses to one quote -> the simple doubling form
+    //     round-trips every password, and the CRT-escaped form BREAKS
+    //     trailing backslashes (7z received abc" for "abc\\").
+    //   - rar.exe/unrar.exe are standard CRT argv programs: a trailing
+    //     backslash must be doubled or the closing quote is escaped
+    //     (child received abc" for the password abc\).
+    private static void TestWinArgQuote()
+    {
+        Console.WriteLine("unit: WinArg quoting for spawned tools");
+        // 7z family: simple doubling form
+        Check("7z plain", WinArg.QuoteForTool("C:\\t\\7z.exe", "plain") == "\"plain\"");
+        Check("7z space", WinArg.QuoteForTool("C:\\t\\7z.exe", "with space") == "\"with space\"");
+        Check("7z embedded quote", WinArg.QuoteForTool("C:\\t\\7z.exe", "a\"b") == "\"a\"\"b\"");
+        Check("7z interior backslash", WinArg.QuoteForTool("C:\\t\\7z.exe", "a\\b") == "\"a\\b\"");
+        Check("7z trailing backslash literal", WinArg.QuoteForTool("C:\\t\\7z.exe", "abc\\") == "\"abc\\\"");
+        // CRT argv family: escaping form
+        Check("rar plain", WinArg.QuoteForTool("C:\\t\\rar.exe", "plain") == "\"plain\"");
+        Check("rar embedded quote", WinArg.QuoteForTool("C:\\t\\rar.exe", "a\"b") == "\"a\\\"b\"");
+        Check("rar interior backslash literal", WinArg.QuoteForTool("C:\\t\\rar.exe", "a\\b") == "\"a\\b\"");
+        Check("rar trailing backslash doubled", WinArg.QuoteForTool("C:\\t\\rar.exe", "abc\\") == "\"abc\\\\\"");
+        Check("rar backslash+quote escaped", WinArg.QuoteForTool("C:\\t\\rar.exe", "a\\\"") == "\"a\\\\\\\"\"");
+        // unknown tool -> CRT argv escaping (the conservative default)
+        Check("unknown tool uses argv escaping", WinArg.QuoteForTool("C:\\t\\other.exe", "abc\\") == "\"abc\\\\\"");
+        // raw Quote() keeps the CRT rules for direct callers
+        Check("argv plain", WinArg.Quote("plain") == "\"plain\"");
+        Check("argv space", WinArg.Quote("with space") == "\"with space\"");
+    }
+
+    // ----------------------------------------------------------------
+    // a RAR5 file whose header chain is truncated mid-vint must parse
+    // gracefully (no crypt record) instead of throwing EndOfStream
+    private static void TestRar5Truncation()
+    {
+        Console.WriteLine("unit: RAR5 truncated header tolerated");
+        string dir = TempDir();
+        try
+        {
+            string p = Path.Combine(dir, "trunc.rar");
+            byte[] sig = new byte[] { 0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00 };
+            byte[] trunc = new byte[] { 0, 0, 0, 0, 0x80, 0x80, 0x80, 0x80, 0x80 };  // CRC + unterminated vint
+            File.WriteAllBytes(p, sig.Concat(trunc).ToArray());
+            ArchiveInfo info = ArchiveParser.Parse(p);
+            Check("detected as rar5", info != null && info.Kind == ArchiveKind.Rar5);
+            Check("no crypt record, no throw", info != null && info.Rar5 == null);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+}
 }

@@ -5,20 +5,13 @@
 #
 #  Usage:
 #    powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
+#    powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1 -ExePath <cli.exe>
 #
-#  What it does:
-#    - rebuilds dist\ via build\build.ps1
-#    - builds encrypted fixtures with WinRAR rar.exe (RAR5 -p / -hp)
-#      and 7z (ZipCrypto / AES-256 zip, 7z). RAR4 cannot be created
-#      by RAR 7; the 7z spawn path is covered by the .7z fixture.
-#    - CLI tests: info, dict hits per format, unencrypted error,
-#      mask attack, combinator, rules preset, encoding matrix
-#      (UTF-8 BOM / UTF-16LE / GBK with Chinese passwords),
-#      checkpoint resume (--max-tries + --resume), benchmark smoke
-#    - GUI test: auto-start via command line, result file appears
-#
-#  Exit code: number of failed tests (0 = all pass).
+#  -ExePath points the suite at a different dictcrack CLI binary (e.g. the
+#  Rust rewrite); GUI tests and the C# build step are skipped in that mode.
 # ============================================================
+
+param([string]$ExePath = '')
 
 $ErrorActionPreference = 'Stop'
 
@@ -29,10 +22,21 @@ $gui  = Join-Path $dist 'dictcrack-gui.exe'
 $cfg  = Join-Path $dist 'dictcrack-gui.cfg'
 
 # ---- build -----------------------------------------------------------
-Write-Output '== building =='
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'build\build.ps1') | ForEach-Object { Write-Output "  $_" }
-if (-not (Test-Path $cli)) { throw 'dictcrack.exe was not produced' }
-if (-not (Test-Path $gui)) { throw 'dictcrack-gui.exe was not produced' }
+if ($ExePath -ne '') {
+    Write-Output ("== external CLI under test: " + $ExePath + " ==")
+    if (-not (Test-Path $ExePath)) { throw ("ExePath not found: " + $ExePath) }
+    $cli = (Resolve-Path $ExePath).Path
+    # session.json / result files are written next to the tested exe; make
+    # sure no stale session from an earlier run leaks into the resume tests
+    $extDir = Split-Path -Parent $cli
+    $stale = Join-Path $extDir 'session.json'
+    if (Test-Path $stale) { Remove-Item -LiteralPath $stale -Force }
+} else {
+    Write-Output '== building =='
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'build\build.ps1') | ForEach-Object { Write-Output "  $_" }
+    if (-not (Test-Path $cli)) { throw 'dictcrack.exe was not produced' }
+    if (-not (Test-Path $gui)) { throw 'dictcrack-gui.exe was not produced' }
+}
 
 # ---- tools -----------------------------------------------------------
 $rar = $null
@@ -63,7 +67,7 @@ $preResults = @(Get-ChildItem (Join-Path $dist '*_password.txt') -ErrorAction Si
 
 $fail = 0
 $tmp = $null
-$session = Join-Path $dist 'session.json'
+$session = Join-Path (Split-Path -Parent $cli) 'session.json'
 
 function Fail([string]$name, [string]$why) {
     Write-Output ("  FAIL {0} ({1})" -f $name, $why)
@@ -132,7 +136,10 @@ try {
         return $d
     }
     function Result-Path([string]$arch) {
-        return Join-Path $dist (([System.IO.Path]::GetFileNameWithoutExtension($arch)) + '_password.txt')
+        # result files land next to the tested exe (dist\ for the C# build,
+        # the exe's own dir for -ExePath), not a fixed directory
+        $exeDir = Split-Path -Parent $script:cli
+        return Join-Path $exeDir (([System.IO.Path]::GetFileNameWithoutExtension($arch)) + '_password.txt')
     }
     function Remove-Result([string]$arch) {
         Remove-Item (Result-Path $arch) -Force -ErrorAction SilentlyContinue
@@ -179,8 +186,12 @@ try {
     Expect-Hit 'test 5' $za $d 'aespw1'
 
     Write-Output 'test 6: 7z archive via external tool fallback'
+    if ($ExePath -ne '') {
+        Write-Output '  SKIP (external-tool fallback is M4 in the Rust build)'
+    } else {
     $d = Write-Dict 'd6.txt' @('apple', '7zpw2')
     Expect-Hit 'test 6' $s7 $d '7zpw2'
+    }
 
     Write-Output 'test 7: unencrypted archive errors out (exit 2)'
     Remove-Result $plain
@@ -275,7 +286,9 @@ try {
 
     # ---- test 17: GUI auto-start e2e ------------------------------------
     Write-Output 'test 17: GUI auto-start finds password and writes result file'
-    if ($rar) {
+    if ($ExePath -ne '') {
+        Write-Output '  SKIP (external CLI has no GUI)'
+    } elseif ($rar) {
         $gArch = New-Rar 'guitest.rar' 'guipw777' $false
         $d = Write-Dict 'd17.txt' @('aaa', 'guipw777', 'bbb')
         Remove-Result $gArch
@@ -303,7 +316,9 @@ try {
     $gComb = Join-Path $tmp 'comb.zip'
     $gA = Join-Path $tmp 'ca.txt'
     $gB = Join-Path $tmp 'cb.txt'
-    if ((Test-Path $gComb) -and (Test-Path $gA) -and (Test-Path $gB)) {
+    if ($ExePath -ne '') {
+        Write-Output '  SKIP (external CLI has no GUI)'
+    } elseif ((Test-Path $gComb) -and (Test-Path $gA) -and (Test-Path $gB)) {
         Remove-Result $gComb
         $p = Start-Process -FilePath $gui -ArgumentList @('-a', $gComb, '-w', $gA, '-w2', $gB, '-t', '4') -PassThru
         $rf = Result-Path $gComb
@@ -322,6 +337,26 @@ try {
         else { Fail 'test 18' ("resultFile=" + $ok + " got='" + $got + "'") }
     } else {
         Write-Output '  SKIP (comb fixture missing)'
+    }
+
+    # ---- test 19: spawn path survives trailing-backslash passwords -----
+    # Regression test for external-tool argument quoting: 7z.exe parses the
+    # RAW command line itself (backslashes literal, "" -> one quote) while
+    # rar.exe uses standard CRT argv rules (a trailing backslash escapes the
+    # closing quote unless doubled). Wrong escaping of either kind turns
+    # the password endbs\ into endbs" or endbs\\ and silently misses hits.
+    # See Verifier.WinArg and the WinArg unit tests.
+    Write-Output 'test 19: external-tool path with trailing-backslash password'
+    if ($ExePath -ne '') {
+        Write-Output '  SKIP (external-tool fallback is M4 in the Rust build)'
+    } else {
+    $bsZip = New-7z 'bs.7z' 'endbs\'
+    $d = Write-Dict 'd19.txt' @('wrong', 'endbs\')
+    Remove-Result $bsZip
+    $code = Run-Cli crack -a $bsZip -w $d -q
+    $got = Read-Result $bsZip
+    if ($code -eq 0 -and $got -eq 'endbs\') { Pass 'test 19' }
+    else { Fail 'test 19' ("exit=" + $code + " got='" + $got + "'") }
     }
 
 } finally {

@@ -340,6 +340,8 @@ impl CrackEngine {
         let live_pos_prod = live_pos.clone();
 
         let cancel_prod = cancel.clone();
+        let cancel_emit = cancel.clone();
+        let external_emit = external.clone();
         let producer_error_prod = producer_error.clone();
         let producer = std::thread::spawn(move || {
             let mut local_pos = live_pos_prod.lock().unwrap().clone();
@@ -350,8 +352,17 @@ impl CrackEngine {
                 let live_pos_prod = &live_pos_prod;
                 let tx = &tx;
                 let mut emit = move |cand: crate::attacks::Candidate, pos: &SourcePosition| {
+                    // stop feeding once a hit / max-tries / Ctrl+C cancelled
+                    // the run: the workers have gone away and a blocking send
+                    // into the bounded queue would deadlock the join. The
+                    // C# side relied on queue.Add(cand, ct) throwing.
+                    if cancel_emit.load(Ordering::Relaxed) || external_emit.load(Ordering::Relaxed) {
+                        return;
+                    }
                     *live_pos_prod.lock().unwrap() = pos.clone();
-                    let _ = tx.send(cand);
+                    // bounded send with a cancel-aware timeout so a vanishing
+                    // consumer can never wedge the producer
+                    let _ = tx.send_timeout(cand, Duration::from_millis(100));
                 };
                 source.enumerate_with_pos(&mut local_pos, &cancel_prod, &mut emit);
             }

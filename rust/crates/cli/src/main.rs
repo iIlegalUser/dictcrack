@@ -401,7 +401,25 @@ fn ctrlc_set_handler<F: Fn() + Send + Sync + 'static>(f: F) -> Result<(), ()> {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // clap cannot express the single-dash multi-char option "-w2" (the C#
+    // combinator flag); rewrite it to the long form "--w2" before parsing so
+    // the CLI contract stays byte-compatible with the C# frontend.
+    let args: Vec<std::ffi::OsString> = std::env::args_os()
+        .map(|a| {
+            if a == "-w2" {
+                std::ffi::OsString::from("--w2")
+            } else if let Some(s) = a.to_str() {
+                if let Some(rest) = s.strip_prefix("-w2=") {
+                    std::ffi::OsString::from(format!("--w2={}", rest))
+                } else {
+                    a.clone()
+                }
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    let cli = Cli::parse_from(args);
     let code = match cli.command {
         Some(Commands::Info { archive, hashcat }) => cmd_info(&archive, hashcat),
         Some(Commands::Bench { archive, threads, seconds }) => cmd_bench(&archive, threads, seconds),
