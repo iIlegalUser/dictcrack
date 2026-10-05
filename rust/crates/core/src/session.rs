@@ -43,28 +43,31 @@ impl SessionState {
         }
     }
 
-    /// Serialises the session atomically (write .tmp, then replace). Returns
-    /// false when the exe directory is not writable - the engine turns that
-    /// into a visible warning instead of silently losing resume support.
+    /// Serialises the session atomically (write .tmp, then replace). The JSON
+    /// is hand-built so the field order matches the C# hand-rolled writer
+    /// exactly (archive, params, dictfp, tried, fileIdx, lineIdx, seg,
+    /// counter, idxA, idxB, saveTime), UTF-8 no BOM. Returns false when the
+    /// exe directory is not writable.
     pub fn save(&self, path: &PathBuf) -> bool {
-        // field order matches the C# hand-rolled JSON exactly
-        let mut map = serde_json::Map::new();
-        map.insert("archive".into(), serde_json::Value::String(self.archive.clone()));
-        map.insert("params".into(), serde_json::Value::String(self.params.clone()));
-        if let Some(fp) = &self.dictfp {
-            map.insert("dictfp".into(), serde_json::Value::String(fp.clone()));
-        }
-        map.insert("tried".into(), self.tried_all.into());
-        map.insert("fileIdx".into(), self.file_idx.into());
-        map.insert("lineIdx".into(), self.line_idx.into());
-        map.insert("seg".into(), self.seg.into());
-        map.insert("counter".into(), self.counter.into());
-        map.insert("idxA".into(), self.idx_a.into());
-        map.insert("idxB".into(), self.idx_b.into());
-        map.insert("saveTime".into(), serde_json::Value::String(self.save_time_text.clone()));
-        let text = serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default() + "\n";
+        let mut sb = String::from("{\n");
+        append_kv(&mut sb, "archive", &self.archive);
+        sb.push_str(",\n");
+        append_kv(&mut sb, "params", &self.params);
+        sb.push_str(",\n");
+        append_kv(&mut sb, "dictfp", self.dictfp.as_deref().unwrap_or(""));
+        sb.push_str(",\n");
+        sb.push_str(&format!("  \"tried\": {},\n", self.tried_all));
+        sb.push_str(&format!("  \"fileIdx\": {},\n", self.file_idx));
+        sb.push_str(&format!("  \"lineIdx\": {},\n", self.line_idx));
+        sb.push_str(&format!("  \"seg\": {},\n", self.seg));
+        sb.push_str(&format!("  \"counter\": {},\n", self.counter));
+        sb.push_str(&format!("  \"idxA\": {},\n", self.idx_a));
+        sb.push_str(&format!("  \"idxB\": {},\n", self.idx_b));
+        append_kv(&mut sb, "saveTime", &self.save_time_text);
+        sb.push('\n');
+        sb.push_str("}\n");
         let tmp = path.with_extension("json.tmp");
-        if fs::write(&tmp, text).is_err() {
+        if fs::write(&tmp, sb).is_err() {
             return false;
         }
         if fs::rename(&tmp, path).is_err() {
@@ -94,6 +97,27 @@ pub fn session_path() -> PathBuf {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("session.json")
+}
+
+/// JSON string-value append with the same escaping as the C# AppendKv:
+/// backslash/quote escaped, control chars as \uXXXX.
+fn append_kv(sb: &mut String, key: &str, val: &str) {
+    sb.push_str("  \"");
+    sb.push_str(key);
+    sb.push_str("\": \"");
+    for c in val.chars() {
+        match c {
+            '\\' | '"' => {
+                sb.push('\\');
+                sb.push(c);
+            }
+            c if (c as u32) < 0x20 => {
+                sb.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => sb.push(c),
+        }
+    }
+    sb.push('"');
 }
 
 #[cfg(test)]
