@@ -1,5 +1,7 @@
 // dictcrack CLI (Rust rewrite of Cli.cs).
 use clap::{Parser, Subcommand};
+use dictcrack_core::archive::{self, ArchiveKind};
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "dictcrack", version, about = "DictCrack - 压缩包密码字典/掩码破解工具（原生引擎）", long_about = None)]
@@ -40,24 +42,96 @@ enum Commands {
     },
 }
 
+fn cmd_info(archive_path: &str, hashcat: bool) -> i32 {
+    if !Path::new(archive_path).exists() {
+        eprintln!("文件不存在: {}", archive_path);
+        return 2;
+    }
+    let info = archive::parse(archive_path);
+    let full = std::fs::canonicalize(archive_path)
+        .map(|p| {
+            let s = p.display().to_string();
+            // canonicalize prepends the \\?\ verbatim prefix on Windows; the
+            // C# Path.GetFullPath output has no such prefix, strip it to keep
+            // the info output byte-identical.
+            s.strip_prefix(r"\\?\").map(|x| x.to_string()).unwrap_or(s)
+        })
+        .unwrap_or_else(|_| archive_path.to_string());
+    println!("文件: {}", full);
+    let size = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
+    println!("大小: {} 字节", size);
+    match info.kind {
+        ArchiveKind::Rar5 => {
+            println!("格式: RAR 5.x");
+            match &info.rar5 {
+                None => println!("加密: 无（未发现加密头记录）"),
+                Some(r) => {
+                    println!(
+                        "加密: {}",
+                        if r.header_encrypted { "RAR5 头加密（-hp）" } else { "RAR5 文件数据加密" }
+                    );
+                    if let Some(n) = &r.entry_name {
+                        println!("目标条目: {}", n);
+                    }
+                    println!("KDF: PBKDF2-HMAC-SHA256, {} 轮", 1u64 << r.lg2_count);
+                    println!(
+                        "密码校验: {}",
+                        if r.psw_check.is_some() { "有（可原生快速验证）" } else { "无（回退外部工具）" }
+                    );
+                    if hashcat {
+                        if r.psw_check.is_some() {
+                            println!("Hashcat (-m 13000): {}", archive::hashcat_rar5(r));
+                        } else {
+                            println!("Hashcat: 该压缩包没有可导出的校验数据");
+                        }
+                    }
+                }
+            }
+        }
+        ArchiveKind::RarLegacy => println!("格式: RAR 1.5-4.x"),
+        ArchiveKind::Zip => {
+            println!("格式: ZIP");
+            match &info.zip {
+                None => println!("加密: 未检测到加密条目"),
+                Some(z) => {
+                    println!("目标条目: {}", z.name);
+                    println!(
+                        "加密方式: {}",
+                        if z.aes {
+                            format!("WinZip AES-{}", z.aes_strength as u32 * 64 + 64)
+                        } else {
+                            "传统 ZipCrypto".to_string()
+                        }
+                    );
+                }
+            }
+        }
+        ArchiveKind::SevenZip => println!("格式: 7z"),
+        ArchiveKind::Unknown => println!("格式: 无法识别（{}）", info.detect_note),
+    }
+    println!(
+        "验证路径: {}",
+        if info.native_supported() { "原生引擎 (native)" } else { "外部工具 (external)" }
+    );
+    0
+}
+
 fn main() {
     let cli = Cli::parse();
-    match cli.command {
-        Some(Commands::Info { archive, hashcat: _ }) => {
-            println!("info: {}", archive);
-            // TODO(M1)
-        }
+    let code = match cli.command {
+        Some(Commands::Info { archive, hashcat }) => cmd_info(&archive, hashcat),
         Some(Commands::Bench { archive, threads, seconds }) => {
-            println!("bench: {} t={} s={}", archive, threads, seconds);
-            // TODO(M2)
+            println!("bench: {} t={} s={} (TODO M2)", archive, threads, seconds);
+            0
         }
         Some(Commands::Crack { archive }) => {
-            println!("crack: {}", archive);
-            // TODO(M3)
+            println!("crack: {} (TODO M3)", archive);
+            0
         }
         None => {
             eprintln!("用法见 dictcrack --help");
-            std::process::exit(2);
+            2
         }
-    }
+    };
+    std::process::exit(code);
 }
