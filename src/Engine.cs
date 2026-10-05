@@ -106,6 +106,16 @@ namespace DictCrack
             }
         }
 
+        /// <summary>
+        /// Runs a full crack attempt: parses the archive, picks a verifier,
+        /// builds the candidate source, restores a matching checkpoint
+        /// session (rewound by a safety margin so queued candidates are
+        /// re-tried, never skipped), then drives one producer thread and N
+        /// verifier threads until a hit, cancellation, --max-tries or
+        /// exhaustion. Saves checkpoints every 3 s; on a hit writes the
+        /// result file (WriteResultText) and deletes the session. Never
+        /// throws for per-candidate errors - failures land in res.Error.
+        /// </summary>
         public CrackResult Run(CancellationToken external)
         {
             CrackResult res = new CrackResult();
@@ -261,7 +271,19 @@ namespace DictCrack
             for (int w = 0; w < threads; w++) workers[w].Start();
             try { foreach (Thread t in workers) t.Join(); producer.Join(); }
             catch { }
-            if (checkpointTimer != null) { using (checkpointTimer) checkpointTimer.Change(Timeout.Infinite, Timeout.Infinite); }
+            if (checkpointTimer != null)
+            {
+                // stop the timer AND wait for a callback already in flight:
+                // otherwise a last checkpoint could be written after the
+                // DeleteSession below and leave a stale session for an
+                // already-cracked archive
+                checkpointTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                using (ManualResetEvent timerDone = new ManualResetEvent(false))
+                {
+                    checkpointTimer.Dispose(timerDone);
+                    timerDone.WaitOne(2000);
+                }
+            }
             Stats.Done = true;
             sw.Stop();
 
@@ -313,6 +335,13 @@ namespace DictCrack
             {
                 if (_cfg.DictFiles.Count < 1 || string.IsNullOrEmpty(_cfg.DictFileB))
                     throw new ApplicationException("组合模式需要两个字典文件。");
+                // check existence up front: otherwise the missing file throws
+                // inside the producer (or the Total getter) and surfaces as a
+                // raw unhandled exception on the CLI instead of a clean error
+                if (_cfg.DictFiles[0] != "-" && !File.Exists(_cfg.DictFiles[0]))
+                    throw new ApplicationException("字典文件不存在: " + _cfg.DictFiles[0]);
+                if (!File.Exists(_cfg.DictFileB))
+                    throw new ApplicationException("字典文件不存在: " + _cfg.DictFileB);
                 return new CombinatorSource(_cfg.DictFiles[0], _cfg.DictFileB);
             }
             if (_cfg.DictFiles.Count == 0) throw new ApplicationException("没有指定字典文件。");
@@ -360,18 +389,24 @@ namespace DictCrack
             catch { return null; }
         }
 
-        private static void WriteResultText(string path, string password)
+        /// <summary>
+        /// Writes the hit password to a result file. Encoding policy: prefer
+        /// explicit GBK (936) so the file opens correctly on Chinese-locale
+        /// text editors, but only when GBK can represent the password
+        /// LOSSLESSLY; otherwise fall back to UTF-8 with BOM. The check is a
+        /// full encode->decode string roundtrip: the byte-level roundtrip
+        /// used before could not catch chars that GBK best-fits to '?'
+        /// (emoji, rare CJK), which silently corrupted such results.
+        /// internal so the unit tests can exercise it directly.
+        /// </summary>
+        internal static void WriteResultText(string path, string password)
         {
             // explicit GBK (936), never Encoding.Default: the system
             // ANSI codepage on a non-Chinese locale silently mangles
-            // Chinese passwords into '?' (roundtrip check cannot catch
-            // that loss - a '?' stays '?' through encode/decode)
+            // Chinese passwords into '?'
             Encoding enc = Encoding.GetEncoding(936);
-            byte[] text = enc.GetBytes(password);
-            byte[] roundtrip = enc.GetBytes(enc.GetString(text));
-            bool lossless = roundtrip.Length == text.Length;
-            for (int i = 0; i < text.Length && lossless; i++) if (roundtrip[i] != text[i]) lossless = false;
-            if (!lossless) enc = new UTF8Encoding(true);
+            if (enc.GetString(enc.GetBytes(password)) != password)
+                enc = new UTF8Encoding(true);
             File.WriteAllText(path, password + "\r\n", enc);
         }
 
@@ -450,6 +485,12 @@ namespace DictCrack
             return DictFp == dictFp;                // sessions saved before this field existed fail for dict runs (safe restart)
         }
 
+        /// <summary>
+        /// Serialises the session atomically (write .tmp, then replace)
+        /// as a small hand-rolled JSON object. Returns false when the exe
+        /// directory is not writable - the engine turns that into a
+        /// visible warning instead of silently losing resume support.
+        /// </summary>
         public bool Save(string path)
         {
             StringBuilder sb = new StringBuilder();
@@ -489,6 +530,11 @@ namespace DictCrack
             sb.Append("\"");
         }
 
+        /// <summary>
+        /// Reads back a file written by Save (tolerant, hand-rolled JSON
+        /// scanner). Returns null for a missing/corrupt file - callers
+        /// treat that as "no session" and start from the beginning.
+        /// </summary>
         public static SessionState Load(string path)
         {
             try
@@ -573,6 +619,13 @@ namespace DictCrack
     // ------------------------------------------------------------------
     public static class Benchmark
     {
+        /// <summary>
+        /// Measures real verification throughput (candidates/second) of a
+        /// verifier over the given thread count; threads &lt;= 0 means auto
+        /// (cores - 2, capped at 32). Each thread hammers random base64
+        /// passwords until the deadline and results are summed - i.e. the
+        /// same PBKDF2 / ZipCrypto / HMAC code path a crack run would use.
+        /// </summary>
         public static double Measure(Verifier verifier, int threads, int seconds)
         {
             if (threads <= 0)

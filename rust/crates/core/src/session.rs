@@ -124,32 +124,74 @@ fn append_kv(sb: &mut String, key: &str, val: &str) {
 mod tests {
     use super::*;
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dcsess-{}-{}", tag, std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    // C# TestSessionRoundTrip: backslash+CJK path, embedded quote, i64/u64
+    // extremes, control char in saveTime - and the exact JSON escaping the
+    // C# hand-rolled writer produces.
     #[test]
     fn roundtrip() {
-        let dir = std::env::temp_dir().join(format!("dcsess-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("rt");
         let p = dir.join("session.json");
+        let s = SessionState {
+            archive: "D:\\test\\\u{6863}\u{6848}.rar".into(), // backslash + CJK
+            params: "ab\"cd".into(),                          // quote escape
+            dictfp: Some("123:456;".into()),
+            tried_all: 12_345_678_901,
+            file_idx: 2,
+            line_idx: 34567,
+            seg: 4,
+            counter: u64::MAX,
+            idx_a: 9,
+            idx_b: 10,
+            save_time_text: "12:00:00\nx".into(), // control char escape
+        };
+        assert!(s.save(&p));
+        let l = SessionState::load(&p).unwrap();
+        assert_eq!(l.archive, s.archive);
+        assert_eq!(l.params, s.params);
+        assert_eq!(l.dictfp, s.dictfp);
+        assert_eq!(l.tried_all, s.tried_all);
+        assert_eq!(l.file_idx, 2);
+        assert_eq!(l.line_idx, 34567);
+        assert_eq!(l.seg, 4);
+        assert_eq!(l.counter, u64::MAX);
+        assert_eq!(l.idx_a, 9);
+        assert_eq!(l.idx_b, 10);
+        assert_eq!(l.save_time_text, "12:00:00\nx");
+
+        // the escaping matches the C# AppendKv byte-for-byte (cross-impl
+        // resume only needs value equality, but the shape keeps diffs sane)
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("\"archive\": \"D:\\\\test\\\\\u{6863}\u{6848}.rar\""), "{}", text);
+        assert!(text.contains("\"params\": \"ab\\\"cd\""), "{}", text);
+        assert!(text.contains("\"saveTime\": \"12:00:00\\u000ax\""), "{}", text);
+        assert!(!text.starts_with("\u{FEFF}"), "UTF-8 no BOM");
+
+        // garbage is not a session
+        std::fs::write(&p, "this is not json {{{").unwrap();
+        assert!(SessionState::load(&p).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matches_semantics() {
         let s = SessionState {
             archive: "D:\\x.rar".into(),
             params: "abc".into(),
             dictfp: Some("fp".into()),
-            tried_all: 42,
-            file_idx: 1,
-            line_idx: 7,
-            seg: 3,
-            counter: 99,
-            idx_a: 5,
-            idx_b: 6,
-            save_time_text: "2026-10-05".into(),
+            ..Default::default()
         };
-        assert!(s.save(&p));
-        let l = SessionState::load(&p).unwrap();
-        assert_eq!(l.tried_all, 42);
-        assert_eq!(l.counter, 99);
-        assert_eq!(l.line_idx, 7);
-        assert!(l.matches("d:\\X.rar", "abc", Some("fp")));
-        assert!(!l.matches("d:\\X.rar", "abc", Some("other")));
-        assert!(!l.matches("d:\\X.rar", "different", Some("fp")));
-        let _ = std::fs::remove_dir_all(&dir);
+        // archive compares case-insensitively (C# OrdinalIgnoreCase)
+        assert!(s.matches("d:\\X.rar", "abc", Some("fp")));
+        assert!(!s.matches("d:\\X.rar", "abc", Some("other")), "dictfp mismatch rejects");
+        assert!(!s.matches("d:\\X.rar", "different", Some("fp")), "params mismatch rejects");
+        assert!(!s.matches("d:\\other.rar", "abc", Some("fp")), "archive mismatch rejects");
+        // fingerprint unavailable: lenient (C# dictFp == null branch)
+        assert!(s.matches("d:\\X.rar", "abc", None));
     }
 }

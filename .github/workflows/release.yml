@@ -1,6 +1,10 @@
 # DictCrack CI/release: build with the in-box .NET Framework 4.8 csc on
 # Windows runners (no SDK restore needed), attach a zip on every run and
 # publish a GitHub Release when a v* tag is pushed.
+#
+# The `rust` job builds/tests the Rust rewrite of the CLI engine
+# (rust\.cargo\config.toml pins x86_64-pc-windows-gnu); the e2e suite runs
+# against the Rust exe via -ExePath. The `release` job collects both zips.
 name: build-release
 
 on:
@@ -27,6 +31,10 @@ jobs:
         shell: pwsh
         run: choco install winrar -y --no-progress
 
+      - name: Run unit tests (no external tools needed)
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/unit-tests.ps1
+
       - name: Run end-to-end tests
         shell: pwsh
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-tests.ps1
@@ -47,11 +55,71 @@ jobs:
           path: dist/*.zip
           if-no-files-found: error
 
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+  rust:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust GNU toolchain (matches rust/.cargo/config.toml)
         shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup override set stable-x86_64-pc-windows-gnu
+
+      - name: Cache cargo builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Unit tests (dictcrack-core)
+        shell: pwsh
+        working-directory: rust
+        run: cargo test --locked
+
+      - name: Build release (single static exe)
+        shell: pwsh
+        working-directory: rust
+        run: cargo build --release --locked
+
+      - name: Install WinRAR (for RAR5 test fixtures)
+        shell: pwsh
+        run: choco install winrar -y --no-progress
+
+      - name: Run end-to-end tests against the Rust CLI
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-tests.ps1 -ExePath rust/target/x86_64-pc-windows-gnu/release/dictcrack.exe
+
+      - name: Package Rust CLI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $stage = Join-Path $env:RUNNER_TEMP 'stage-rust'
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item rust/target/x86_64-pc-windows-gnu/release/dictcrack.exe, README.md, passwords_sample.txt -Destination $stage
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath "dist/DictCrack-rust-${{ github.ref_name }}.zip"
+
+      - name: Upload Rust artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DictCrack-rust-${{ github.ref_name }}
+          path: dist/DictCrack-rust-*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [build, rust]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" "dist/DictCrack-${{ github.ref_name }}.zip" `
+          gh release create "${{ github.ref_name }}" dist/*.zip \
             --title "DictCrack ${{ github.ref_name }}" --generate-notes

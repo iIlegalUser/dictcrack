@@ -55,6 +55,14 @@ namespace DictCrack
 
     public static class RawLines
     {
+        /// <summary>
+        /// Streams raw (undecoded) lines from a stream as byte segments,
+        /// resuming at startOffset (e.g. past a UTF-8 BOM). Tolerates
+        /// CRLF/LF and a missing trailing newline, and grows its buffer for
+        /// single lines longer than 1 MB. Segments alias an internal buffer
+        /// that shifts between iterations - callers must decode before the
+        /// next MoveNext. Honours ct for prompt cancellation.
+        /// </summary>
         public static IEnumerable<RawLine> Enumerate(Stream fs, long startOffset, System.Threading.CancellationToken ct)
         {
             if (startOffset > 0) fs.Seek(startOffset, SeekOrigin.Begin);
@@ -115,10 +123,14 @@ namespace DictCrack
             }
         }
 
-        // Plans the encoding sweep for a stream (position is left where it
-        // was). bomSkip tells the raw byte splitter how many bytes of a
-        // UTF-8 BOM to skip so the first line does not carry a U+FEFF;
-        // UTF-16 BOMs are consumed by StreamReader itself.
+        /// <summary>
+        /// Plans which encodings a dictionary should be tried under. A BOM
+        /// pins the encoding (UTF-8 / UTF-16LE / UTF-16BE, bomSkip = bytes
+        /// of BOM to skip for the raw splitter); without a BOM the first
+        /// 256 KB are strict-decoded as UTF-8 - valid text sweeps UTF-8 +
+        /// ANSI(GBK), anything else runs GBK only. The probe can only add
+        /// encodings, never skip one a hit could appear in.
+        /// </summary>
         public static List<Encoding> Plan(Stream fs, out string planNote, out long bomSkip)
         {
             bomSkip = 0;
@@ -217,6 +229,11 @@ namespace DictCrack
             "年份后缀 1980-今年+1", "数字后缀 0-9/00-99", "leet 变形(a@e3o0i1s5g9)",
             "倒序", "首字母大写", "双写(abcabc)" };
 
+        /// <summary>
+        /// Expands one dictionary word under a mutation preset (years /
+        /// digits / leet / rev / cap / double). Pure function: returns the
+        /// mutated variants only, the caller chains presets and dedupes.
+        /// </summary>
         public static IEnumerable<string> Apply(string preset, string w)
         {
             if (string.IsNullOrEmpty(w)) yield break;
@@ -350,6 +367,14 @@ namespace DictCrack
             return ms;
         }
 
+        /// <summary>
+        /// Streams dictionary candidates, resuming from pos (FileIdx +
+        /// LineIdx). Each raw line is decoded under every planned encoding
+        /// (see DictEncoding.Plan) and then mutated by the selected chained
+        /// presets; UTF-16 files are split with a StreamReader and run the
+        /// same mutation stage. `emitted` is reused per line to keep GC
+        /// pressure down; a generator thread only.
+        /// </summary>
         public IEnumerable<Candidate> Enumerate(SourcePosition pos, System.Threading.CancellationToken ct)
         {
             // reused across lines (producer thread only) - allocating a
@@ -397,6 +422,15 @@ namespace DictCrack
                                 if (t == null) continue;
                                 if (_global != null && !_global.Add(t)) continue;
                                 yield return new Candidate(t, tag);
+                                // mutation presets apply to UTF-16 dictionaries
+                                // too - only the line SPLITTING is special here
+                                if (_presets.Count > 0)
+                                {
+                                    emitted.Clear();
+                                    emitted[t] = tag;
+                                    foreach (Candidate cand in MutateChained(emitted))
+                                        yield return cand;
+                                }
                             }
                         }
                     }
@@ -416,6 +450,12 @@ namespace DictCrack
             }
         }
 
+        /// <summary>
+        /// Decodes one raw line under every planned encoding (the encoding
+        /// sweep, per-line deduped) and then chains the mutation presets on
+        /// top of the base words. Iterator method: the caller streams
+        /// candidates straight into the producer queue.
+        /// </summary>
         private IEnumerable<Candidate> DecodeAndMutate(byte[] buf, int offset, int count, List<Encoding> encs, Dictionary<string, string> emitted)
         {
             // decode the line under every planned encoding (the encoding
@@ -434,29 +474,38 @@ namespace DictCrack
                     yield return new Candidate(t, tag);
                 }
             }
-            // chained mutations: each preset also mutates the outputs of
-            // the presets before it (word -> word+year -> word+year+digits)
             if (_presets.Count > 0)
+                foreach (Candidate cand in MutateChained(emitted))
+                    yield return cand;
+        }
+
+        // chained mutations over the base words collected in `emitted`
+        // (values are the tags to keep): each preset also mutates the
+        // outputs of the presets before it (word -> word+year ->
+        // word+year+digits); shared by the byte-level sweep and the UTF-16
+        // reader path. Mutants carry the tag of their base word and join
+        // the --dedupe set as they are emitted; the MutationCap bounds the
+        // per-line fan-out.
+        private IEnumerable<Candidate> MutateChained(Dictionary<string, string> emitted)
+        {
+            List<KeyValuePair<string, string>> frontier = new List<KeyValuePair<string, string>>(emitted);
+            for (int pi = 0; pi < _presets.Count; pi++)
             {
-                List<KeyValuePair<string, string>> frontier = new List<KeyValuePair<string, string>>(emitted);
-                for (int pi = 0; pi < _presets.Count; pi++)
+                if (emitted.Count >= MutationCap) yield break;
+                List<KeyValuePair<string, string>> next = new List<KeyValuePair<string, string>>();
+                foreach (KeyValuePair<string, string> kv in frontier)
                 {
-                    if (emitted.Count >= MutationCap) yield break;
-                    List<KeyValuePair<string, string>> next = new List<KeyValuePair<string, string>>();
-                    foreach (KeyValuePair<string, string> kv in frontier)
+                    foreach (string m in Rules.Apply(_presets[pi], kv.Key))
                     {
-                        foreach (string m in Rules.Apply(_presets[pi], kv.Key))
-                        {
-                            if (emitted.ContainsKey(m)) continue;
-                            if (_global != null && !_global.Add(m)) continue;
-                            if (emitted.Count >= MutationCap) yield break;
-                            emitted[m] = kv.Value;   // mutations keep the tag of the base word
-                            next.Add(new KeyValuePair<string, string>(m, kv.Value));
-                            yield return new Candidate(m, kv.Value);
-                        }
+                        if (emitted.ContainsKey(m)) continue;
+                        if (_global != null && !_global.Add(m)) continue;
+                        if (emitted.Count >= MutationCap) yield break;
+                        emitted[m] = kv.Value;   // mutations keep the tag of the base word
+                        next.Add(new KeyValuePair<string, string>(m, kv.Value));
+                        yield return new Candidate(m, kv.Value);
                     }
-                    frontier = next;
                 }
+                frontier = next;
             }
         }
 
@@ -580,6 +629,12 @@ namespace DictCrack
             return string.Format("长度 {0} 进度 {1}", pos.Seg, pos.Counter);
         }
 
+        /// <summary>
+        /// Streams mask candidates for lengths _minLen.._maxLen, resuming
+        /// from pos (Seg = length, Counter = odometer within that length).
+        /// Charset slots count down the counter least-significant-first;
+        /// fixed strings render whole and consume no counter digits.
+        /// </summary>
         public IEnumerable<Candidate> Enumerate(SourcePosition pos, System.Threading.CancellationToken ct)
         {
             // capture the saved position once: pos is mutated below and must
@@ -692,6 +747,13 @@ namespace DictCrack
 
         public string PositionText(SourcePosition pos) { return string.Format("A行 {0} B行 {1}", pos.IdxA, pos.IdxB); }
 
+        /// <summary>
+        /// Streams A×B candidates (every encoding-sweep variant of each A
+        /// line joined to every deduped B line). B is loaded fully into
+        /// memory once; resume via pos (IdxA/IdxB), where saved IdxB applies
+        /// only to the first variant of the resumed A line - re-trying a
+        /// few candidates is safe, skipping them would miss passwords.
+        /// </summary>
         public IEnumerable<Candidate> Enumerate(SourcePosition pos, System.Threading.CancellationToken ct)
         {
             List<string> b = LoadB();

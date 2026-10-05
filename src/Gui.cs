@@ -934,7 +934,9 @@ namespace DictCrack
                         Directory.CreateDirectory(dir);
                         ProcessStartInfo psi = new ProcessStartInfo();
                         psi.FileName = tool;
-                        psi.Arguments = "x -y -p\"" + pwd.Replace("\"", "\"\"") + "\" -o\"" + dir + "\" \"" + arch + "\"";
+                        // per-tool quoting, see Verifier.WinArg (7z self-parse
+                        // vs CRT argv rules; trailing backslashes and quotes)
+                        psi.Arguments = "x -y -p" + WinArg.QuoteForTool(tool, pwd) + " -o" + WinArg.QuoteForTool(tool, dir) + " " + WinArg.QuoteForTool(tool, arch);
                         psi.UseShellExecute = false;
                         psi.CreateNoWindow = true;
                         psi.RedirectStandardOutput = true;
@@ -1061,9 +1063,13 @@ namespace DictCrack
             {
                 SetStatus("出错: " + res.Error, cRed);
             }
-            else if (res.Cancelled)
+            else if (res.Cancelled || res.MaxedOut)
             {
-                SetStatus(chkResume.Checked ? "已停止（进度已保存，下次开始可选择继续）。" : "已停止。", cSub);
+                // a maxed-out run also checkpoints and can resume, so it
+                // must not be reported as a plain "not found"
+                SetStatus(res.MaxedOut
+                    ? "已达到尝试上限，已停止（进度已保存，下次开始可选择继续）。"
+                    : (chkResume.Checked ? "已停止（进度已保存，下次开始可选择继续）。" : "已停止。"), cSub);
             }
             else
             {

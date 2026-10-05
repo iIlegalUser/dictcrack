@@ -39,16 +39,22 @@ namespace DictCrack
             return r;
         }
 
-    // ----------------------------------------------------------------
-    private static bool Hashcat;
+        // ----------------------------------------------------------------
+        private static bool Hashcat;
 
-    private static int CmdInfo(string[] args)
-    {
-        if (args.Length < 1) { Console.Error.WriteLine("用法: dictcrack info <archive> [--hashcat]"); return 2; }
-        string path = args[0];
-        if (!File.Exists(path)) { Console.Error.WriteLine("文件不存在: " + path); return 2; }
-        Hashcat = Array.IndexOf(args, "--hashcat") >= 0;
-        ArchiveInfo info = ArchiveParser.Parse(path);
+        private static int CmdInfo(string[] args)
+        {
+            if (args.Length < 1) { Console.Error.WriteLine("用法: dictcrack info <archive> [--hashcat]"); return 2; }
+            string path = args[0];
+            if (!File.Exists(path)) { Console.Error.WriteLine("文件不存在: " + path); return 2; }
+            Hashcat = Array.IndexOf(args, "--hashcat") >= 0;
+            ArchiveInfo info;
+            try { info = ArchiveParser.Parse(path); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("无法读取该文件（可能被占用或权限不足）: " + ex.Message);
+                return 2;
+            }
             Console.WriteLine("文件: " + Path.GetFullPath(path));
             Console.WriteLine("大小: " + new FileInfo(path).Length + " 字节");
             switch (info.Kind)
@@ -103,7 +109,13 @@ namespace DictCrack
             int seconds = ParseInt(GetOpt(args, new string[] { "--seconds" }), 3);
             if (archive == null) { Console.Error.WriteLine("用法: dictcrack bench -a <archive> [-t 线程] [--seconds 秒]"); return 2; }
             if (!File.Exists(archive)) { Console.Error.WriteLine("文件不存在: " + archive); return 2; }
-            ArchiveInfo info = ArchiveParser.Parse(archive);
+            ArchiveInfo info;
+            try { info = ArchiveParser.Parse(archive); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("无法读取该文件（可能被占用或权限不足）: " + ex.Message);
+                return 2;
+            }
             if (!info.NativeSupported)
             {
                 Console.Error.WriteLine("该压缩包不支持原生验证（" + info.DetectNote + "），基准测速需要 RAR5 或加密 ZIP。");
@@ -237,7 +249,11 @@ namespace DictCrack
             Console.WriteLine("正在解压到 " + dir + " ...");
             ProcessStartInfo psi = new ProcessStartInfo();
             psi.FileName = tool;
-            psi.Arguments = "x -y -p\"" + password.Replace("\"", "\"\"") + "\" -o\"" + dir + "\" \"" + archive + "\"";
+            // per-tool quoting: 7z.exe self-parses the raw command line
+            // (doubling form), rar.exe is a standard argv program (see
+            // Verifier.WinArg) - a trailing backslash in password/dir would
+            // otherwise corrupt the argument
+            psi.Arguments = "x -y -p" + WinArg.QuoteForTool(tool, password) + " -o" + WinArg.QuoteForTool(tool, dir) + " " + WinArg.QuoteForTool(tool, archive);
             psi.UseShellExecute = false;
             using (Process p = Process.Start(psi))
             {

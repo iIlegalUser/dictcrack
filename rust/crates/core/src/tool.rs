@@ -138,14 +138,10 @@ impl Verifier for SpawnVerifier {
         if password.contains('\r') || password.contains('\n') {
             return false;
         }
-        let args = format!(
-            "t -y -p{} {}",
-            WinArg::quote_for_tool(&self.tool, password),
-            WinArg::quote_for_tool(&self.tool, &self.archive_path)
-        );
-        // split the quoted command line the way the tool expects: the child
-        // re-parses the raw line itself, so spawn with a single /C-style arg
-        // string is wrong. Build the argv vector directly instead.
+        // pass each argument raw with the tool's own quoting applied: 7z.exe
+        // re-parses the raw command line itself (doubling form) while
+        // rar.exe is a CRT argv program, so std's automatic escaping (which
+        // follows neither rule) must be bypassed with raw_arg
         let pwd_arg = format!("-p{}", WinArg::quote_for_tool(&self.tool, password));
         let arch_arg = WinArg::quote_for_tool(&self.tool, &self.archive_path);
         let status = Command::new(&self.tool)
@@ -157,7 +153,6 @@ impl Verifier for SpawnVerifier {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        let _ = args; // documented form; actual spawn uses raw_arg above
         match status {
             Ok(s) => s.success(),
             Err(_) => false,
@@ -186,5 +181,38 @@ mod tests {
     fn per_tool_selection() {
         assert_eq!(WinArg::quote_for_tool(r"C:\7-Zip\7z.exe", "x\\"), "\"x\\\"");
         assert_eq!(WinArg::quote_for_tool(r"C:\WinRAR\rar.exe", "x\\"), "\"x\\\\\"");
+    }
+
+    // full matrix from the C# TestWinArgQuote (rules verified against the
+    // real 7z.exe/rar.exe by round-tripping actual passwords)
+    #[test]
+    fn seven_zip_family_doubling_form() {
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\7z.exe", "plain"), "\"plain\"");
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\7z.exe", "with space"), "\"with space\"");
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\7z.exe", "a\"b"), "\"a\"\"b\"");
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\7z.exe", "a\\b"), "\"a\\b\"");
+        // trailing backslash stays literal: 7z parses the raw line itself
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\7z.exe", "abc\\"), "\"abc\\\"");
+    }
+
+    #[test]
+    fn rar_family_argv_escaping() {
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\rar.exe", "plain"), "\"plain\"");
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\rar.exe", "a\"b"), "\"a\\\"b\"");
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\rar.exe", "a\\b"), "\"a\\b\"");
+        // a trailing backslash escapes the closing quote unless doubled
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\rar.exe", "abc\\"), "\"abc\\\\\"");
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\rar.exe", "a\\\""), "\"a\\\\\\\"\"");
+    }
+
+    #[test]
+    fn unknown_tool_uses_conservative_argv_escaping() {
+        assert_eq!(WinArg::quote_for_tool(r"C:\t\other.exe", "abc\\"), "\"abc\\\\\"");
+    }
+
+    #[test]
+    fn raw_quote_keeps_crt_rules() {
+        assert_eq!(WinArg::quote("plain"), "\"plain\"");
+        assert_eq!(WinArg::quote("with space"), "\"with space\"");
     }
 }

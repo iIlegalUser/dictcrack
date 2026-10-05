@@ -43,6 +43,10 @@ pub struct ArchiveInfo {
     pub rar5: Option<Rar5CryptInfo>,
     pub zip: Option<ZipTargetInfo>,
     pub detect_note: String,
+    /// the file could not be opened at all (locked / no permission / a
+    /// directory): a hard error, distinct from "parsed but nothing found".
+    /// The C# build surfaces this by throwing out of ReadHead.
+    pub open_error: Option<String>,
 }
 
 impl ArchiveInfo {
@@ -57,16 +61,19 @@ impl ArchiveInfo {
     }
 }
 
-fn read_head(path: &Path, count: usize) -> Vec<u8> {
+fn read_head(path: &Path, count: usize) -> std::io::Result<Vec<u8>> {
+    let mut f = File::open(path)?;
     let mut buf = vec![0u8; count];
-    match File::open(path) {
-        Ok(mut f) => {
-            let n = f.read(&mut buf).unwrap_or(0);
-            buf.truncate(n);
-            buf
+    let mut n = 0usize;
+    while n < count {
+        match f.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(m) => n += m,
+            Err(e) => return Err(e),
         }
-        Err(_) => Vec::new(),
     }
+    buf.truncate(n);
+    Ok(buf)
 }
 
 fn read_vint(buf: &[u8], pos: &mut usize) -> Result<u64, ()> {
@@ -607,9 +614,11 @@ fn parse_zip(path: &Path) -> Option<ZipTargetInfo> {
     best
 }
 
-/// Top-level sniff + parse. Port of ArchiveParser.Parse. Never throws:
-/// failures surface as a null rar5/zip plus a detect_note, and the engine
-/// falls back to the external tool.
+/// Top-level sniff + parse. Port of ArchiveParser.Parse. Never throws for
+/// damaged data: failures surface as a null rar5/zip plus a detect_note, and
+/// the engine falls back to the external tool. A file that cannot be opened
+/// at all is the one hard failure: it lands in open_error (the C# build
+/// throws out of ReadHead and the CLI turns that into exit 2).
 pub fn parse(path: &str) -> ArchiveInfo {
     let p = Path::new(path);
     let mut info = ArchiveInfo {
@@ -617,8 +626,18 @@ pub fn parse(path: &str) -> ArchiveInfo {
         rar5: None,
         zip: None,
         detect_note: String::new(),
+        open_error: None,
     };
-    let head = read_head(p, 8);
+    // a locked/unreadable path must not become "unknown format" - that
+    // would send crack off to burn the whole dictionary against a verifier
+    // that can never succeed
+    let head = match read_head(p, 8) {
+        Ok(h) => h,
+        Err(e) => {
+            info.open_error = Some(e.to_string());
+            return info;
+        }
+    };
     if head.len() >= 8
         && head[0] == 0x52 && head[1] == 0x61 && head[2] == 0x72 && head[3] == 0x21
         && head[4] == 0x1A && head[5] == 0x07 && head[6] == 0x01 && head[7] == 0x00
@@ -656,4 +675,169 @@ pub fn parse(path: &str) -> ArchiveInfo {
     }
     info.detect_note = "unrecognized signature; will try external tool anyway".into();
     info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("dcarch-{}-{}", tag, std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    fn write_temp(tag: &str, name: &str, data: &[u8]) -> std::path::PathBuf {
+        let p = temp_dir(tag).join(name);
+        File::create(&p).unwrap().write_all(data).unwrap();
+        p
+    }
+
+    // little-endian byte writer, the stand-in for C#'s BinaryWriter
+    #[derive(Default)]
+    struct W(Vec<u8>);
+    impl W {
+        fn u16(&mut self, x: u16) -> &mut Self {
+            self.0.extend_from_slice(&x.to_le_bytes());
+            self
+        }
+        fn u32(&mut self, x: u32) -> &mut Self {
+            self.0.extend_from_slice(&x.to_le_bytes());
+            self
+        }
+        fn i64(&mut self, x: i64) -> &mut Self {
+            self.0.extend_from_slice(&x.to_le_bytes());
+            self
+        }
+        fn b(&mut self, x: u8) -> &mut Self {
+            self.0.push(x);
+            self
+        }
+        fn bytes(&mut self, x: &[u8]) -> &mut Self {
+            self.0.extend_from_slice(x);
+            self
+        }
+    }
+
+    // minimal encrypted-ZipCrypto ZIP with all classic fields at 0xFFFFFFFF
+    // and the real values in ZIP64 records/extra fields (C# BuildZip64Fixture)
+    fn build_zip64_fixture() -> Vec<u8> {
+        let mut w = W::default();
+        w.u32(0x0403_4b50).u16(20).u16(0x0001).u16(8).u16(0).u16(0x5A00);
+        w.u32(0x1234_5678); // crc
+        w.u32(0xFFFF_FFFF).u32(0xFFFF_FFFF); // comp/uncomp size (zip64)
+        w.u16(1).u16(20); // name len, extra len (zip64: 4+16)
+        w.b(b'a');
+        w.u16(0x0001).u16(16).i64(262_144).i64(100);
+        let data = vec![0x5Au8; 100]; // contents not verified by the parser
+        w.bytes(&data);
+        let cd_offset = w.0.len() as u64;
+        w.u32(0x0201_4b50).u16(20).u16(20).u16(0x0001).u16(8).u16(0).u16(0x5A00);
+        w.u32(0x1234_5678);
+        w.u32(0xFFFF_FFFF).u32(0xFFFF_FFFF);
+        w.u16(1).u16(28).u16(0).u16(0).u16(0).u32(0);
+        w.u32(0xFFFF_FFFF); // local offset (zip64)
+        w.b(b'a');
+        w.u16(0x0001).u16(24).i64(262_144).i64(100).i64(0);
+        let cd_size = w.0.len() as u64 - cd_offset;
+        let z64_pos = w.0.len() as u64;
+        w.u32(0x0606_4b50).i64(44).u16(45).u16(45).u32(0).u32(0);
+        w.i64(1).i64(1).i64(cd_size as i64).i64(cd_offset as i64);
+        w.u32(0x0706_4b50).u32(0).i64(z64_pos as i64).u32(1);
+        w.u32(0x0605_4b50).u16(0xFFFF).u16(0xFFFF).u16(0xFFFF).u16(0xFFFF);
+        w.u32(0xFFFF_FFFF).u32(0xFFFF_FFFF).u16(0);
+        w.0
+    }
+
+    #[test]
+    fn zip64_fixture_parses() {
+        let p = write_temp("z64", "z64.zip", &build_zip64_fixture());
+        let info = parse(&p.display().to_string());
+        assert_eq!(info.kind, ArchiveKind::Zip, "detected as zip");
+        let z = info.zip.expect("zip64 entry parsed");
+        assert_eq!(z.name, "a", "zip64 name");
+        assert!(!z.aes, "zip64 not aes");
+        assert_eq!(z.comp_data_size, 88, "comp size 100-12 enc header");
+        assert_eq!(z.data_start, 63, "30+1+20 local header + 12 enc header");
+        assert_eq!(z.check_byte, 0x12, "crc>>24");
+    }
+
+    // ZIP64 with more than 65535 entries: the classic EOCD count field holds
+    // 0xFFFF and the real count lives in the ZIP64 EOCD record. Regression:
+    // a count truncated to u16 made a 65536-entry archive parse as 0 entries.
+    fn build_zip64_many_entries(n: usize) -> Vec<u8> {
+        let mut w = W::default();
+        w.u32(0x0403_4b50).u16(20).u16(0x0001).u16(8).u16(0).u16(0x5A00);
+        w.u32(0x1234_5678).u32(100).u32(100).u16(1).u16(0);
+        w.b(b'e');
+        w.bytes(&vec![0u8; 12 + 100]); // 12-byte enc header + payload
+        let cd_offset = w.0.len() as u64;
+        for i in 0..n {
+            let last = i == n - 1;
+            w.u32(0x0201_4b50).u16(20).u16(20).u16(if last { 0x0001 } else { 0 }).u16(8);
+            w.u16(0).u16(0x5A00).u32(0x1234_5678).u32(100).u32(100);
+            w.u16(1).u16(0).u16(0).u16(0).u16(0).u32(0);
+            w.u32(0); // local offset (only 'last' is opened)
+            w.b(if last { b'e' } else { b'x' });
+        }
+        let cd_size = w.0.len() as u64 - cd_offset;
+        let z64_pos = w.0.len() as u64;
+        w.u32(0x0606_4b50).i64(44).u16(45).u16(45).u32(0).u32(0);
+        w.i64(n as i64).i64(n as i64).i64(cd_size as i64).i64(cd_offset as i64);
+        w.u32(0x0706_4b50).u32(0).i64(z64_pos as i64).u32(1);
+        w.u32(0x0605_4b50).u16(0xFFFF).u16(0xFFFF).u16(0xFFFF).u16(0xFFFF);
+        w.u32(0xFFFF_FFFF).u32(0xFFFF_FFFF).u16(0);
+        w.0
+    }
+
+    #[test]
+    fn zip64_many_entries_65536() {
+        let p = write_temp("many", "many.zip", &build_zip64_many_entries(65536));
+        let info = parse(&p.display().to_string());
+        assert_eq!(info.kind, ArchiveKind::Zip, "many-entry zip64 detected");
+        let z = info.zip.expect("encrypted entry found despite 65536 entries");
+        assert_eq!(z.name, "e", "many-entry target name");
+        assert_eq!(z.comp_data_size, 88, "many-entry comp size");
+    }
+
+    #[test]
+    fn hashcat_rar5_format() {
+        let ci = Rar5CryptInfo {
+            salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            lg2_count: 15,
+            psw_check: Some([0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7]),
+            header_encrypted: false,
+            entry_name: None,
+        };
+        assert_eq!(
+            hashcat_rar5(&ci),
+            "$rar5$16$000102030405060708090a0b0c0d0e0f$15$a0a1a2a3a4a5a6a7$8"
+        );
+    }
+
+    // a RAR5 file whose header chain is truncated mid-vint must parse
+    // gracefully (no crypt record) instead of erroring
+    #[test]
+    fn rar5_truncated_header_tolerated() {
+        let mut data = vec![0x52u8, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+        data.extend_from_slice(&[0, 0, 0, 0, 0x80, 0x80, 0x80, 0x80, 0x80]); // CRC + unterminated vint
+        let p = write_temp("trunc", "trunc.rar", &data);
+        let info = parse(&p.display().to_string());
+        assert_eq!(info.kind, ArchiveKind::Rar5, "detected as rar5");
+        assert!(info.rar5.is_none(), "no crypt record, no error");
+    }
+
+    // a path that cannot be opened (a directory on Windows) is a hard
+    // open_error, not "unknown format" - mirrors the C# build, where
+    // ReadHead throws and the CLI reports exit 2
+    #[test]
+    fn unreadable_path_sets_open_error() {
+        let d = temp_dir("lock");
+        let info = parse(&d.display().to_string());
+        assert!(info.open_error.is_some(), "directory open must surface as open_error");
+        assert_eq!(info.kind, ArchiveKind::Unknown);
+        assert!(info.rar5.is_none() && info.zip.is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

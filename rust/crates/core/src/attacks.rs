@@ -43,6 +43,14 @@ pub trait CandidateSource {
     fn total(&mut self) -> Option<u64>;
     fn describe(&self) -> String;
     fn position_text(&self, pos: &SourcePosition) -> String;
+
+    /// encoding plan note reported by the "未找到密码。（编码方案: …）" line;
+    /// only the dictionary source produces one (C# reads
+    /// DictionarySource.LastPlanNote in Engine.Run and leaves LogNote alone
+    /// for the other sources)
+    fn plan_note(&self) -> Option<String> {
+        None
+    }
 }
 
 // ------------------------------------------------------------------
@@ -300,6 +308,10 @@ impl DictionarySource {
 }
 
 impl CandidateSource for DictionarySource {
+    fn plan_note(&self) -> Option<String> {
+        Some(self.last_plan_note.clone())
+    }
+
     fn total(&mut self) -> Option<u64> {
         // with mutation presets each line fans out content-dependently; unknown
         if !self.presets.is_empty() {
@@ -382,12 +394,12 @@ impl CandidateSource for DictionarySource {
 
             if utf16 {
                 // UTF-16 bytes can contain 0x0A inside a character: decode whole
-                // then split lines.
+                // then split lines. StreamReader semantics: the BOM is consumed.
                 let enc = plan.encs[0];
                 let tag = enc.label();
                 let mut all = Vec::new();
                 let _ = stream.read_to_end(&mut all);
-                let body = &all[plan.bom_skip as usize..];
+                let body = encoding::strip_utf16_bom(&all[plan.bom_skip as usize..]);
                 if let Some(text) = encoding::decode(enc, body) {
                     let mut line_idx = 0i64;
                     for line in text.lines() {
@@ -697,6 +709,7 @@ impl CombinatorSource {
                 let _ = f.read_to_end(&mut data);
                 let body = &data[plan.bom_skip as usize..];
                 if plan.encs.len() == 1 && plan.encs[0].is_utf16() {
+                    let body = encoding::strip_utf16_bom(body);
                     if let Some(text) = encoding::decode(plan.encs[0], body) {
                         for line in text.lines() {
                             let line = line.strip_suffix('\r').unwrap_or(line);
@@ -764,7 +777,7 @@ impl CandidateSource for CombinatorSource {
         }
         let utf16a = plan.encs.len() == 1 && plan.encs[0].is_utf16();
         if utf16a {
-            let body = &data[plan.bom_skip as usize..];
+            let body = encoding::strip_utf16_bom(&data[plan.bom_skip as usize..]);
             if let Some(text) = encoding::decode(plan.encs[0], body) {
                 let mut idx_a = 0i64;
                 for line in text.lines() {
@@ -844,40 +857,92 @@ impl CandidateSource for CombinatorSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::plan_bytes;
+    use std::io::Write;
 
-    fn collect_mask(mask: &str, min: usize, max: usize) -> Vec<String> {
-        let mut src = MaskSource::new(mask, &[String::new(), String::new(), String::new(), String::new()], min, max);
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("dcatt-{}-{}", tag, std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    fn collect(src: &mut dyn CandidateSource) -> Vec<String> {
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut out = Vec::new();
         let mut pos = SourcePosition::default();
+        let mut out = Vec::new();
         src.enumerate_with_pos(&mut pos, &cancel, &mut |c, _p| out.push(c.pw));
         out
     }
 
+    // ---- mask (C# TestMaskSource) ------------------------------------
+
+    fn mask_source(mask: &str, sets: &[&str; 4], min: usize, max: usize) -> MaskSource {
+        let arr = [sets[0].to_string(), sets[1].to_string(), sets[2].to_string(), sets[3].to_string()];
+        MaskSource::new(mask, &arr, min, max)
+    }
+
     #[test]
     fn mask_digits() {
-        let v = collect_mask("?d?d", 2, 2);
-        assert_eq!(v.len(), 100);
+        let mut m = mask_source("?d?d", &["", "", "", ""], 2, 2);
+        assert_eq!(m.total(), Some(100));
+        let v = collect(&mut m);
         assert_eq!(v[0], "00");
+        assert_eq!(v[1], "01");
         assert_eq!(v[99], "99");
     }
 
     #[test]
     fn mask_prefix() {
         // "ab?d" is 2 tokens (fixed "ab" + charset "d"); length counts tokens
-        let v = collect_mask("ab?d", 2, 2);
+        let v = collect(&mut mask_source("ab?d", &["", "", "", ""], 2, 2));
         assert_eq!(v.len(), 10);
         assert_eq!(v[0], "ab0");
         assert_eq!(v[9], "ab9");
     }
 
     #[test]
-    fn rules_years_digits() {
+    fn mask_min_max_and_custom_and_overflow() {
+        let mut m2 = mask_source("?d?d?d", &["", "", "", ""], 1, 2);
+        assert_eq!(m2.total(), Some(110), "lengths 1+2 over ?d?d?d");
+        let mut m3 = mask_source("ab?1", &["xy", "", "", ""], 2, 2);
+        assert_eq!(m3.total(), Some(2), "custom set of 2");
+        // ?a x 16 overflows u64 -> unknown total
+        let mut big = mask_source(
+            "?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a",
+            &["", "", "", ""],
+            1,
+            16,
+        );
+        assert_eq!(big.total(), None, "total overflow -> None");
+    }
+
+    // ---- rules (C# TestRules) ----------------------------------------
+
+    #[test]
+    fn rules_years_dynamic() {
+        let y_max = current_year() + 1;
+        let mut out = Vec::new();
+        Rules::apply("years", "w", &mut out);
+        assert_eq!(out.len() as i32, y_max - 1980 + 1, "years dynamic count");
+        assert!(out.contains(&format!("w{}", y_max)), "years includes current+1");
+    }
+
+    #[test]
+    fn rules_digits() {
         let mut out = Vec::new();
         Rules::apply("digits", "pw", &mut out);
         assert!(out.contains(&"pw0".to_string()));
         assert!(out.contains(&"pw99".to_string()));
-        assert_eq!(out.len(), 10 + 100);
+        assert_eq!(out.len(), 110);
+    }
+
+    #[test]
+    fn rules_empty_word_no_output() {
+        for p in Rules::PRESET_NAMES {
+            let mut out = Vec::new();
+            Rules::apply(p, "", &mut out);
+            assert!(out.is_empty(), "empty word no output for {}", p);
+        }
     }
 
     #[test]
@@ -891,5 +956,166 @@ mod tests {
         out.clear();
         Rules::apply("cap", "abc", &mut out);
         assert_eq!(out, vec!["Abc".to_string()]);
+    }
+
+    // ---- dictionary source (C# TestDictionarySource) ------------------
+
+    #[test]
+    fn dict_bom_file() {
+        let dir = temp_dir("bom");
+        let bom = dir.join("bom.txt");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("alpha\r\nbeta\n".as_bytes());
+        std::fs::write(&bom, &bytes).unwrap();
+        let mut src = DictionarySource::new(vec![bom.display().to_string()], vec![], false);
+        let got = collect(&mut src);
+        assert_eq!(got.len(), 2, "bom file line count");
+        assert_eq!(got[0], "alpha", "bom stripped from first line");
+        assert_eq!(got[1], "beta");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dict_gbk_chinese() {
+        let dir = temp_dir("gbk");
+        let gbk = dir.join("gbk.txt");
+        let (b, _, _) = encoding_rs::GBK.encode("密码test\n");
+        std::fs::write(&gbk, &*b).unwrap();
+        let mut src = DictionarySource::new(vec![gbk.display().to_string()], vec![], false);
+        let got = collect(&mut src);
+        assert_eq!(got, vec!["密码test".to_string()], "gbk decode");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dict_chained_mutations() {
+        let dir = temp_dir("chain");
+        let plain = dir.join("p.txt");
+        std::fs::write(&plain, "foo\n").unwrap();
+        let mut src =
+            DictionarySource::new(vec![plain.display().to_string()], vec!["years".into(), "digits".into()], false);
+        let got = collect(&mut src);
+        assert!(got.contains(&"foo".to_string()), "base word present");
+        assert!(got.contains(&"foo1999".to_string()), "year suffix");
+        assert!(got.contains(&"foo19990".to_string()), "chained year+digit");
+        assert_eq!(got.iter().position(|w| w == "foo"), Some(0), "no cross dup: base first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dict_dedupe_collapses_repeated_file() {
+        let dir = temp_dir("dedupe");
+        let plain = dir.join("p.txt");
+        std::fs::write(&plain, "foo\nbar\n").unwrap();
+        let mut single = DictionarySource::new(vec![plain.display().to_string()], vec![], false);
+        let mut dupe =
+            DictionarySource::new(vec![plain.display().to_string(), plain.display().to_string()], vec![], true);
+        assert_eq!(collect(&mut dupe).len(), collect(&mut single).len(), "dedupe collapses repeated file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn combinator_pair_and_total() {
+        let dir = temp_dir("comb");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let mut ab = vec![0xEF_u8, 0xBB, 0xBF];
+        ab.extend_from_slice(b"x\n");
+        std::fs::write(&a, &ab).unwrap();
+        let mut bb = vec![0xEF_u8, 0xBB, 0xBF];
+        bb.extend_from_slice(b"y\n");
+        std::fs::write(&b, &bb).unwrap();
+        let mut comb = CombinatorSource::new(a.display().to_string(), b.display().to_string());
+        let got = collect(&mut comb);
+        assert!(got.contains(&"xy".to_string()), "combinator pair");
+        assert_eq!(comb.total(), Some(1), "combinator total");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- UTF-16 dictionary + rules (C# TestUtf16Rules) -----------------
+
+    #[test]
+    fn utf16_dict_runs_mutation_presets() {
+        let dir = temp_dir("u16");
+        let p = dir.join("u16.txt");
+        let mut bytes = vec![0xFF_u8, 0xFE];
+        for unit in "foo\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        let mut src = DictionarySource::new(vec![p.display().to_string()], vec!["digits".into()], false);
+        let got = collect(&mut src);
+        assert!(!got.is_empty() && got[0] == "foo", "utf16 base word first");
+        assert!(got.contains(&"foo0".to_string()), "utf16 single-digit suffix");
+        assert!(got.contains(&"foo99".to_string()), "utf16 double-digit suffix");
+        assert_eq!(got.len(), 111, "utf16 fan-out 111");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- raw line splitter (C# TestRawLines) ---------------------------
+
+    #[test]
+    fn raw_lines_crlf_lf_no_trailing() {
+        let dir = temp_dir("rl");
+        let f = dir.join("lines.txt");
+        std::fs::write(&f, b"ab\r\ncd\nef").unwrap();
+        let mut file = File::open(&f).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut got: Vec<(String, i64)> = Vec::new();
+        RawLines::new().enumerate(&mut file, 0, &cancel, &mut |seg, idx| {
+            got.push((String::from_utf8_lossy(seg).into_owned(), idx));
+        });
+        assert_eq!(got.len(), 3, "crlf/lf/no-trailing");
+        assert_eq!(got[0], ("ab".to_string(), 0));
+        assert_eq!(got[1], ("cd".to_string(), 1));
+        assert_eq!(got[2], ("ef".to_string(), 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_lines_longer_than_initial_buffer() {
+        let dir = temp_dir("big");
+        let f = dir.join("big.txt");
+        let payload = vec![b'x'; 3 << 20];
+        {
+            let mut fh = File::create(&f).unwrap();
+            fh.write_all(&payload).unwrap();
+        }
+        let mut file = File::open(&f).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut got: Vec<usize> = Vec::new();
+        RawLines::new().enumerate(&mut file, 0, &cancel, &mut |seg, _idx| got.push(seg.len()));
+        assert_eq!(got.len(), 1, "one line");
+        assert_eq!(got[0], payload.len(), "line longer than 1MB buffer survives");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- encoding plan (C# TestEncodingPlan) ---------------------------
+
+    #[test]
+    fn encoding_plan_utf8_bom() {
+        let p = plan_bytes(&[0xEF, 0xBB, 0xBF, 0x61], 4);
+        assert_eq!(p.note, "UTF-8 (BOM)");
+        assert_eq!(p.bom_skip, 3);
+    }
+
+    #[test]
+    fn encoding_plan_utf16le_bom() {
+        let p = plan_bytes(&[0xFF, 0xFE, 0x61, 0x00], 4);
+        assert_eq!(p.note, "UTF-16LE (BOM)");
+        assert_eq!(p.bom_skip, 0);
+    }
+
+    #[test]
+    fn encoding_plan_gbk_only() {
+        let (b, _, _) = encoding_rs::GBK.encode("密码");
+        let p = plan_bytes(&b, b.len() as u64);
+        assert_eq!(p.note, "ANSI(GBK)");
+    }
+
+    #[test]
+    fn encoding_plan_ascii_dual_sweep() {
+        let p = plan_bytes(b"abc", 3);
+        assert_eq!(p.note, "UTF-8 + ANSI(GBK)");
     }
 }

@@ -316,6 +316,65 @@ namespace DictCrack
         public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
     }
 
+    /// <summary>
+    /// Builds command lines for the spawned extraction tools. There is no
+    /// single correct quoting: 7z.exe parses the RAW command line itself
+    /// (backslashes are always literal, "" collapses to one quote, and a
+    /// trailing backslash must NOT be doubled), while rar.exe/unrar.exe are
+    /// standard CRT argv programs (\" escapes a quote and backslash runs
+    /// before a quote must be doubled, so an unescaped trailing backslash
+    /// corrupts the argument). Both rules were verified by round-tripping
+    /// passwords through the real tools. QuoteForTool picks per tool;
+    /// SimpleQuote is the 7z-family form.
+    /// </summary>
+    internal static class WinArg
+    {
+        // 7z family (7z.exe/7za/7zr/7zG): self-parsing, doubling rules
+        public static string SimpleQuote(string s)
+        {
+            return "\"" + s.Replace("\"", "\"\"") + "\"";
+        }
+
+        // standard CRT/CommandLineToArgvW escaping: every backslash run that
+        // is followed by a quote (including the closing one) is doubled, an
+        // embedded quote becomes \" - e.g. password abc\ must arrive as
+        // "abc\\" or the child receives abc" instead of abc\
+        public static string Quote(string s)
+        {
+            StringBuilder sb = new StringBuilder(s.Length + 8);
+            sb.Append('"');
+            int slashes = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '\\') { slashes++; continue; }
+                if (c == '"')
+                {
+                    sb.Append('\\', slashes * 2 + 1);   // pending runs precede a quote
+                    slashes = 0;
+                }
+                else if (slashes > 0)
+                {
+                    sb.Append('\\', slashes);           // interior runs stay literal
+                    slashes = 0;
+                }
+                sb.Append(c);
+            }
+            sb.Append('\\', slashes * 2);               // run before the closing quote
+            sb.Append('"');
+            return sb.ToString();
+        }
+
+        // one stop helper: quote value for the tool being spawned
+        public static string QuoteForTool(string toolPath, string value)
+        {
+            string name;
+            try { name = Path.GetFileName(toolPath ?? ""); } catch { name = ""; }
+            bool sevenZipFamily = name.StartsWith("7z", StringComparison.OrdinalIgnoreCase);
+            return sevenZipFamily ? SimpleQuote(value) : Quote(value);
+        }
+    }
+
     // ------------------------------------------------------------------
     // everything the native paths cannot handle goes through 7z t -p<pwd>
     public sealed class SpawnVerifier : Verifier
@@ -329,10 +388,9 @@ namespace DictCrack
         public override bool Verify(string password)
         {
             if (password.IndexOf('\r') >= 0 || password.IndexOf('\n') >= 0) return false;
-            string quoted = "\"" + password.Replace("\"", "\"\"") + "\"";
             ProcessStartInfo psi = new ProcessStartInfo();
             psi.FileName = _tool;
-            psi.Arguments = "t -y -p" + quoted + " \"" + SpawnVerifier.ArchivePath + "\"";
+            psi.Arguments = "t -y -p" + WinArg.QuoteForTool(_tool, password) + " " + WinArg.QuoteForTool(_tool, SpawnVerifier.ArchivePath);
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             psi.RedirectStandardOutput = true;
@@ -358,6 +416,15 @@ namespace DictCrack
     // ------------------------------------------------------------------
     public static class VerifierFactory
     {
+        /// <summary>
+        /// Picks the verifier for an archive: RAR5 crypt record -> native
+        /// header check; encrypted ZIP entry -> native ZipCrypto/AES check
+        /// (the smallest entry is confirmed, AES preferred); anything else
+        /// (RAR4, 7z, -hp without check data, unknown) -> 7z/rar.exe spawn.
+        /// Also points the static archive paths and the ZIP entry cache at
+        /// the archive being worked on. Throws ApplicationException only
+        /// when the spawn fallback is needed but no tool can be found.
+        /// </summary>
         public static Verifier Create(ArchiveInfo info, string userTool, string archivePath)
         {
             if (!string.IsNullOrEmpty(archivePath))

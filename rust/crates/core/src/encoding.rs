@@ -120,6 +120,21 @@ fn decode_utf16(bytes: &[u8], be: bool) -> Option<String> {
     String::from_utf16(&units).ok()
 }
 
+/// UTF-16 body with a leading BOM removed. The C# path decodes UTF-16
+/// dictionaries through StreamReader, which consumes the BOM itself; plan()
+/// reports bom_skip=0 for UTF-16 (the byte-level splitter never sees those
+/// files), so the UTF-16 branches must strip it here instead - otherwise the
+/// first line carries a U+FEFF and can never match.
+pub fn strip_utf16_bom(bytes: &[u8]) -> &[u8] {
+    if bytes.len() >= 2
+        && ((bytes[0] == 0xFF && bytes[1] == 0xFE) || (bytes[0] == 0xFE && bytes[1] == 0xFF))
+    {
+        &bytes[2..]
+    } else {
+        bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

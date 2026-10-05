@@ -9,7 +9,7 @@ use crate::session::{self, SessionState};
 use crate::verifier::{self, Verifier};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -105,7 +105,9 @@ impl EngineStats {
 }
 
 /// content fingerprint of every dictionary feeding the run (size+mtime);
-/// a changed dictionary invalidates the session.
+/// a changed dictionary invalidates the session. The mtime is expressed as
+/// .NET DateTime.Ticks (100 ns since 0001-01-01) so a session saved by the
+/// C# build resumes under the Rust build and vice versa (spec §7.2).
 pub fn dict_fingerprint(cfg: &CrackConfig) -> Option<String> {
     if cfg.mode == "mask" {
         return Some(String::new());
@@ -128,15 +130,25 @@ pub fn dict_fingerprint(cfg: &CrackConfig) -> Option<String> {
             continue;
         }
         let md = std::fs::metadata(f).ok()?;
-        let mtime = md
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos();
+        let mtime = dotnet_ticks(&md.modified().ok()?);
         sb.push_str(&format!("{}:{};", md.len(), mtime));
     }
     Some(sb)
+}
+
+/// SystemTime -> .NET DateTime.Ticks (100 ns units since 0001-01-01, the
+/// value DateTime.LastWriteTimeUtc.Ticks reports). 621355968000000000 is the
+/// tick offset of the Unix epoch; on Windows the underlying filetime has
+/// exactly 100 ns resolution so the value matches the C# build bit-for-bit.
+fn dotnet_ticks(t: &std::time::SystemTime) -> u128 {
+    const UNIX_EPOCH_TICKS: u128 = 621_355_968_000_000_000;
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => UNIX_EPOCH_TICKS + d.as_nanos() / 100,
+        Err(e) => {
+            let before = e.duration();
+            UNIX_EPOCH_TICKS.saturating_sub(before.as_nanos() / 100)
+        }
+    }
 }
 
 fn count_mask_tokens(mask: &str) -> usize {
@@ -230,12 +242,20 @@ impl CrackEngine {
                 s.strip_prefix(r"\\?\").map(|x| x.to_string()).unwrap_or(s)
             })
             .unwrap_or_else(|_| self.cfg.archive_path.clone());
-        if !Path::new(&archive).exists() {
+        // File.Exists in C# is "exists and is a regular file", so a directory
+        // takes the "不存在" branch just like a missing archive
+        let apath = Path::new(&archive);
+        if !apath.exists() || apath.is_dir() {
             res.error = Some(format!("压缩包文件不存在: {}", archive));
             return res;
         }
 
         let info = archive::parse(&archive);
+        if let Some(err) = &info.open_error {
+            // C# Engine: "解析压缩包失败: " + ex.Message
+            res.error = Some(format!("解析压缩包失败: {}", err));
+            return res;
+        }
 
         // pick the verifier: native first, else the 7z/rar spawn fallback
         let verifier_obj: Box<dyn Verifier + Send + Sync> = match verifier::create_native(&info, &archive) {
@@ -357,6 +377,11 @@ impl CrackEngine {
         let cancel_emit = cancel.clone();
         let external_emit = external.clone();
         let producer_error_prod = producer_error.clone();
+        // the encoding plan note is produced during enumeration inside the
+        // producer thread; carry it back through a shared slot (the C# build
+        // just reads the shared source object after the producer finished)
+        let plan_note: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let plan_note_prod = plan_note.clone();
         let producer = std::thread::spawn(move || {
             let mut local_pos = live_pos_prod.lock().unwrap().clone();
             // the emit closure writes the live position before each send; to
@@ -365,7 +390,7 @@ impl CrackEngine {
             {
                 let live_pos_prod = &live_pos_prod;
                 let tx = &tx;
-                let mut emit = move |cand: crate::attacks::Candidate, pos: &SourcePosition| {
+                let mut emit = move |mut cand: crate::attacks::Candidate, pos: &SourcePosition| {
                     // stop feeding once a hit / max-tries / Ctrl+C cancelled
                     // the run: the workers have gone away and a blocking send
                     // into the bounded queue would deadlock the join. The
@@ -374,13 +399,33 @@ impl CrackEngine {
                         return;
                     }
                     *live_pos_prod.lock().unwrap() = pos.clone();
-                    // bounded send with a cancel-aware timeout so a vanishing
-                    // consumer can never wedge the producer
-                    let _ = tx.send_timeout(cand, Duration::from_millis(100));
+                    // bounded send with a cancel-aware retry loop: workers
+                    // can be wedged past the timeout (e.g. a slow spawn
+                    // verifier), and a candidate dropped here is also skipped
+                    // by --resume (live_pos already advanced past it), so
+                    // retry until it is delivered or the run is over. A bare
+                    // send() would re-introduce the M3 deadlock: a cancel
+                    // arriving after the consumers exited would block the
+                    // producer forever.
+                    loop {
+                        match tx.send_timeout(cand, Duration::from_millis(100)) {
+                            Ok(()) => break,
+                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return,
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(pending)) => {
+                                cand = pending;
+                                if cancel_emit.load(Ordering::Relaxed) || external_emit.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 };
                 source.enumerate_with_pos(&mut local_pos, &cancel_prod, &mut emit);
             }
             *live_pos_prod.lock().unwrap() = local_pos;
+            if let Some(n) = source.plan_note() {
+                *plan_note_prod.lock().unwrap() = Some(n);
+            }
             // tx dropped here (via the closure capture ending) closes the channel
             let _ = &producer_error_prod;
         });
@@ -451,7 +496,15 @@ impl CrackEngine {
             let save_failed_clone = save_failed.clone();
             let handle = std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(3000));
+                    // sleep in short slices so the final join after a hit or
+                    // stop does not add up to a full 3 s tail to the reported
+                    // elapsed time (the C# build wakes its timer instead)
+                    for _ in 0..30 {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -485,9 +538,6 @@ impl CrackEngine {
             let _ = w.join();
         }
         let _ = producer.join();
-        if external.load(Ordering::Relaxed) && hit_password.lock().unwrap().is_none() {
-            // honour external cancel inside producer too
-        }
         checkpoint_stop.store(true, Ordering::Relaxed);
         if let Some((h, sf)) = checkpoint_handle {
             let _ = h.join();
@@ -544,6 +594,13 @@ impl CrackEngine {
         if session_save_failed && !res.found {
             res.warning = Some("会话/进度文件写入失败（exe 目录可能只读），断点续跑不可用。".into());
         }
+        // C# Engine.Run: LogNote = ((DictionarySource)source).LastPlanNote --
+        // an unconditional overwrite for dictionary runs (the session-
+        // mismatch note above is replaced by the encoding plan note, exactly
+        // like the C# build); other sources leave the note untouched
+        if let Some(note) = plan_note.lock().unwrap().clone() {
+            *self.log_note.lock().unwrap() = note;
+        }
         res
     }
 
@@ -556,11 +613,11 @@ impl CrackEngine {
         let default_path = exe_dir.join(format!("{}_password.txt", stem));
         if let Some(out) = &self.cfg.out_file {
             let p = PathBuf::from(out);
-            if result::write_result_text(&p, password, "").is_ok() {
+            if result::write_result_text(&p, password).is_ok() {
                 return Some(out.clone());
             }
         }
-        if result::write_result_text(&default_path, password, "").is_ok() {
+        if result::write_result_text(&default_path, password).is_ok() {
             return Some(default_path.display().to_string());
         }
         None
@@ -568,18 +625,41 @@ impl CrackEngine {
 }
 
 fn now_text() -> String {
-    // local time "yyyy-MM-dd HH:mm:ss"; good enough for a checkpoint stamp
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    format!("{}s", secs % 1000000)
+    // local time "HH:mm:ss", matching the C# SaveTimeText stamp shown by
+    // the "续跑: ..." phase line. GetLocalTime on Windows keeps the stamp
+    // identical to the C# build's DateTime.Now; other platforms fall back
+    // to UTC (cosmetic difference only).
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetLocalTime(out: *mut SystemTime);
+        }
+        let mut st = SystemTime { year: 0, month: 0, day_of_week: 0, day: 0, hour: 0, minute: 0, second: 0, milliseconds: 0 };
+        unsafe { GetLocalTime(&mut st) };
+        format!("{:02}:{:02}:{:02}", st.hour, st.minute, st.second)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+    }
 }
 
 // ------------------------------------------------------------------
 // Benchmark (from the M2 step).
-use crate::verifier::Verifier as _BenchVerifier;
-use std::sync::atomic::AtomicU64 as _AtomicU64;
-use std::time::Duration as _Duration;
-
 pub fn bench_measure(
     verifier: &Arc<dyn Verifier + Send + Sync>,
     threads: u32,
@@ -591,8 +671,8 @@ pub fn bench_measure(
     } else {
         threads
     };
-    let total = Arc::new(_AtomicU64::new(0));
-    let deadline = _Duration::from_secs(seconds as u64);
+    let total = Arc::new(AtomicU64::new(0));
+    let deadline = Duration::from_secs(seconds as u64);
     let start = Instant::now();
     let mut handles = Vec::new();
     for t in 0..threads {
@@ -619,6 +699,83 @@ pub fn bench_measure(
     total.load(Ordering::Relaxed) as f64 / elapsed
 }
 
-// silence the unused-import helper alias when only bench uses them
-#[allow(unused_imports)]
-use _BenchVerifier as _BenchVerifierUsed;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionState;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dceng-{}-{}", tag, std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn dict_fp_deterministic_and_content_sensitive() {
+        let dir = temp_dir("fp");
+        let f = dir.join("d.txt");
+        std::fs::write(&f, "one\n").unwrap();
+        let mut cfg = CrackConfig { mode: "dict".into(), dict_files: vec![f.display().to_string()], ..Default::default() };
+        let fp1 = dict_fingerprint(&cfg).unwrap();
+        assert_eq!(fp1, dict_fingerprint(&cfg).unwrap(), "fp deterministic");
+        // a fingerprint must look like the C# build's size:Ticks pairs
+        assert!(fp1.ends_with(';') && fp1.contains(':'), "fp shape: {}", fp1);
+        let ticks: u128 = fp1.split(';').next().unwrap().split(':').nth(1).unwrap().parse().unwrap();
+        assert!(ticks > 630_000_000_000_000_000, "ticks in .NET range: {}", ticks);
+        // rewrite with different content: size changes, so must the fp
+        std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+        assert_ne!(fp1, dict_fingerprint(&cfg).unwrap(), "fp changes with content");
+
+        // old sessions saved without a dictfp are rejected for dict runs
+        let old = SessionState { archive: "a.rar".into(), params: "p".into(), ..Default::default() };
+        assert!(!old.matches("a.rar", "p", Some(&fp1)), "old session (no fp) rejected for dict");
+        // fingerprint unavailable: keep the lenient behavior
+        assert!(old.matches("a.rar", "p", None), "null fp keeps lenient");
+        let with_fp = SessionState { archive: "a.rar".into(), params: "p".into(), dictfp: Some(fp1.clone()), ..Default::default() };
+        assert!(with_fp.matches("a.rar", "p", Some(&fp1)), "matching fp accepted");
+
+        cfg.mode = "mask".into();
+        assert_eq!(dict_fingerprint(&cfg), Some(String::new()), "mask fp empty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dict_fp_comb_and_stdin_shapes() {
+        let dir = temp_dir("fpc");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "x\n").unwrap();
+        std::fs::write(&b, "y\n").unwrap();
+        let cfg = CrackConfig {
+            mode: "comb".into(),
+            dict_files: vec![a.display().to_string()],
+            dict_file_b: Some(b.display().to_string()),
+            ..Default::default()
+        };
+        let fp = dict_fingerprint(&cfg).unwrap();
+        // A and B both feed the fingerprint, in that order
+        assert_eq!(fp.matches(':').count(), 2);
+        let stdin_cfg = CrackConfig { mode: "dict".into(), dict_files: vec!["-".into()], ..Default::default() };
+        assert_eq!(dict_fingerprint(&stdin_cfg), Some("stdin;".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dotnet_ticks_matches_clr() {
+        // DateTime(1970,1,1).UtcTicks == 621355968000000000
+        let t = std::time::UNIX_EPOCH;
+        assert_eq!(dotnet_ticks(&t), 621_355_968_000_000_000);
+        // 2026-01-01T00:00:00Z -> 621355968000000000 + 56 years of seconds
+        // (1767225600 s; leap days included) - guards against a unit slip
+        let d = std::time::Duration::from_secs(1_767_225_600);
+        assert_eq!(dotnet_ticks(&(t + d)), 621_355_968_000_000_000 + 1_767_225_600u128 * 10_000_000);
+    }
+
+    #[test]
+    fn now_text_is_clock_shaped() {
+        let s = now_text();
+        assert_eq!(s.len(), 8, "HH:mm:ss shape");
+        assert_eq!(&s[2..3], ":", "colon at 2");
+        assert_eq!(&s[5..6], ":", "colon at 5");
+    }
+}

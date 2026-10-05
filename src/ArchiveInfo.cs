@@ -64,6 +64,14 @@ namespace DictCrack
             return sb.ToString();
         }
 
+        /// <summary>
+        /// Sniffs the archive kind from the signature and extracts whatever
+        /// native password verification needs: RAR5 crypt records (salt,
+        /// iteration count, folded PswCheck) or the best encrypted ZIP entry
+        /// descriptor (ZipCrypto / WinZip-AES, ZIP64 aware). Never throws
+        /// for damaged data - failures surface as a null Rar5/Zip plus a
+        /// DetectNote, and the engine falls back to the external tool.
+        /// </summary>
         public static ArchiveInfo Parse(string path)
         {
             ArchiveInfo info = new ArchiveInfo();
@@ -120,6 +128,11 @@ namespace DictCrack
         // bytes. The extra area is the LAST ExtraAreaSize bytes of the
         // body, so type-specific fields never need parsing except for
         // HEAD_CRYPT where the crypt data IS the type-specific part.
+        // RAR5 header walk. Returns the first usable crypt record found
+        // (file-level CRYPT extra beats nothing; an archive-encryption
+        // HEAD_CRYPT record short-circuits the walk). Truncated or corrupt
+        // header chains are tolerated: parsing stops and whatever was
+        // found so far is returned instead of throwing on a damaged file.
         private static Rar5CryptInfo ParseRar5(string path)
         {
             using (FileStream fs = File.OpenRead(path))
@@ -127,62 +140,68 @@ namespace DictCrack
             {
                 fs.Seek(8, SeekOrigin.Begin);
                 Rar5CryptInfo fromFileHeader = null;
-                while (true)
+                try
                 {
-                    long headerStart = fs.Position;
-                    if (headerStart + 7 > fs.Length) return fromFileHeader;
-                    br.ReadBytes(4); // header CRC32
-                    ulong headerSize = ReadVint(br);
-                    if (headerSize == 0 || headerSize > 0x10000000L) return fromFileHeader;
-                    long bodyStart = fs.Position;
-                    long bodyEnd = bodyStart + (long)headerSize;
-                    if (bodyEnd > fs.Length) return fromFileHeader;
-                    byte[] body = br.ReadBytes((int)headerSize);
-                    int pos = 0;
-                    ulong type = ReadVint(body, ref pos);
-                    ulong flags = ReadVint(body, ref pos);
-                    ulong extraSize = (flags & 0x0001UL) != 0 ? ReadVint(body, ref pos) : 0;
-                    ulong dataSize = (flags & 0x0002UL) != 0 ? ReadVint(body, ref pos) : 0;
-
-                    if (type == 5) return fromFileHeader; // end of archive
-
-                    if (type == 4)
+                    while (true)
                     {
-                        // archive encryption header (-hp): version, flags,
-                        // lg2, salt, [check+csum]; no IV here and the whole
-                        // rest of the archive is encrypted
-                        Rar5CryptInfo ci = ParseRar5CryptBody(body, pos, false, true, null);
-                        return ci; // nothing else readable when headers are encrypted
-                    }
+                        long headerStart = fs.Position;
+                        if (headerStart + 7 > fs.Length) return fromFileHeader;
+                        br.ReadBytes(4); // header CRC32
+                        ulong headerSize = ReadVint(br);
+                        if (headerSize == 0 || headerSize > 0x10000000L) return fromFileHeader;
+                        long bodyStart = fs.Position;
+                        long bodyEnd = bodyStart + (long)headerSize;
+                        if (bodyEnd > fs.Length) return fromFileHeader;
+                        byte[] body = br.ReadBytes((int)headerSize);
+                        int pos = 0;
+                        ulong type = ReadVint(body, ref pos);
+                        ulong flags = ReadVint(body, ref pos);
+                        ulong extraSize = (flags & 0x0001UL) != 0 ? ReadVint(body, ref pos) : 0;
+                        ulong dataSize = (flags & 0x0002UL) != 0 ? ReadVint(body, ref pos) : 0;
 
-                    if ((type == 2 || type == 3) && extraSize > 0 && fromFileHeader == null)
-                    {
-                        // FILE / SERVICE header: scan extra records for CRYPT
-                        long extraStart = body.Length - (long)extraSize;
-                        if (extraStart >= pos)
+                        if (type == 5) return fromFileHeader; // end of archive
+
+                        if (type == 4)
                         {
-                            int epos = (int)extraStart;
-                            int eend = body.Length;
-                            while (epos + 2 <= eend)
+                            // archive encryption header (-hp): version, flags,
+                            // lg2, salt, [check+csum]; no IV here and the whole
+                            // rest of the archive is encrypted
+                            Rar5CryptInfo ci = ParseRar5CryptBody(body, pos, false, true, null);
+                            return ci; // nothing else readable when headers are encrypted
+                        }
+
+                        if ((type == 2 || type == 3) && extraSize > 0 && fromFileHeader == null)
+                        {
+                            // FILE / SERVICE header: scan extra records for CRYPT
+                            long extraStart = body.Length - (long)extraSize;
+                            if (extraStart >= pos)
                             {
-                                int recStart = epos;
-                                ulong recSize = ReadVint(body, ref epos);
-                                if (recSize == 0 || recStart + (long)recSize > eend) break;
-                                int recEnd = recStart + (int)recSize;
-                                ulong recType = ReadVint(body, ref epos);
-                                if (recType == 1)
+                                int epos = (int)extraStart;
+                                int eend = body.Length;
+                                while (epos + 2 <= eend)
                                 {
-                                    string name = TryReadFileName(body, pos, extraStart);
-                                    Rar5CryptInfo ci = ParseRar5CryptBody(body, epos, true, false, name);
-                                    if (ci != null) { fromFileHeader = ci; break; }
+                                    int recStart = epos;
+                                    ulong recSize = ReadVint(body, ref epos);
+                                    if (recSize == 0 || recStart + (long)recSize > eend) break;
+                                    int recEnd = recStart + (int)recSize;
+                                    ulong recType = ReadVint(body, ref epos);
+                                    if (recType == 1)
+                                    {
+                                        string name = TryReadFileName(body, pos, extraStart);
+                                        Rar5CryptInfo ci = ParseRar5CryptBody(body, epos, true, false, name);
+                                        if (ci != null) { fromFileHeader = ci; break; }
+                                    }
+                                    epos = recEnd;
                                 }
-                                epos = recEnd;
                             }
                         }
+                        // jump to next header; data area (file payload) is skipped
+                        fs.Seek(bodyEnd + (long)dataSize, SeekOrigin.Begin);
                     }
-                    // jump to next header; data area (file payload) is skipped
-                    fs.Seek(bodyEnd + (long)dataSize, SeekOrigin.Begin);
                 }
+                catch (EndOfStreamException) { return fromFileHeader; }   // truncated header chain
+                catch (InvalidDataException) { return fromFileHeader; }   // corrupt vint
+                catch (IOException) { return fromFileHeader; }
             }
         }
 
@@ -296,7 +315,11 @@ namespace DictCrack
                     { eocd = i; break; }
                 }
                 if (eocd < 0) return null;
-                ushort entryCount = BitConverter.ToUInt16(tail, eocd + 10);
+                // entry count must stay wider than the 16-bit EOCD field:
+                // a ZIP64 archive with >65535 entries stores 0xFFFF here and
+                // the real count in the ZIP64 EOCD record (truncating to
+                // ushort turned 65536 entries into 0 and skipped the CD)
+                uint entryCount = BitConverter.ToUInt16(tail, eocd + 10);
                 long cdSize = BitConverter.ToUInt32(tail, eocd + 12);
                 // the EOCD stores absolute offsets; subtract what lies before
                 // them so archives with a prepended stub (SFX) still parse
@@ -319,7 +342,7 @@ namespace DictCrack
                             long entries64 = BitConverter.ToInt64(z64, 32);
                             long cdSize64 = BitConverter.ToInt64(z64, 40);
                             long cdOffset64 = BitConverter.ToInt64(z64, 48);
-                            if (entryCount == 0xFFFF) entryCount = (ushort)Math.Min(entries64, int.MaxValue);
+                            if (entryCount == 0xFFFFu) entryCount = (uint)Math.Min(entries64, (long)uint.MaxValue);
                             if (cdSize == 0xFFFFFFFF) cdSize = cdSize64;
                             if (cdOffset == 0xFFFFFFFF) cdOffset = cdOffset64;
                             usedZip64Eocd = cdSize64 > 0 || cdOffset64 > 0;
@@ -340,7 +363,7 @@ namespace DictCrack
 
                 ZipTargetInfo best = null;
                 long pos = cdOffset;
-                for (int n = 0; n < entryCount; n++)
+                for (long n = 0; n < entryCount; n++)
                 {
                     if (pos + 46 > fs.Length) break;
                     fs.Seek(pos, SeekOrigin.Begin);

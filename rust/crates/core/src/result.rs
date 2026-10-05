@@ -5,11 +5,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// Writes the found password (and optional note) to `path`. GBK is preferred
-/// so a Chinese Notepad reads it directly, but a password GBK cannot
-/// represent (emoji, rare chars) is written as UTF-8 with BOM instead.
-pub fn write_result_text(path: &PathBuf, password: &str, note: &str) -> std::io::Result<()> {
-    let body = format!("{}\r\n{}", password, note);
+/// Writes the found password to `path`. GBK is preferred so a Chinese
+/// Notepad reads it directly, but a password GBK cannot represent (emoji,
+/// rare chars) is written as UTF-8 with BOM instead. The body is exactly
+/// `password + CRLF`, matching the C# WriteResultText byte-for-byte.
+pub fn write_result_text(path: &PathBuf, password: &str) -> std::io::Result<()> {
+    let body = format!("{}\r\n", password);
     let bytes = match encode_gbk_lossless(&body) {
         Some(b) => b,
         None => {
@@ -41,7 +42,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dcres-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("r.txt");
-        write_result_text(&p, "密码abc123", "note").unwrap();
+        write_result_text(&p, "密码abc123").unwrap();
         let bytes = std::fs::read(&p).unwrap();
         // GBK: no UTF-8 BOM, and decodes back via GBK
         assert!(!(bytes.starts_with(&[0xEF, 0xBB, 0xBF])));
@@ -55,11 +56,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dcres2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("r.txt");
-        write_result_text(&p, "pw🎉", "note").unwrap();
+        write_result_text(&p, "pw🎉").unwrap();
         let bytes = std::fs::read(&p).unwrap();
         assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
         let text = String::from_utf8_lossy(&bytes[3..]).into_owned();
         assert!(text.contains("pw🎉"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trailing_backslash_survives_gbk() {
+        // backslash is GBK-representable and must not be eaten or doubled
+        let dir = std::env::temp_dir().join(format!("dcres3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("r.txt");
+        write_result_text(&p, "abc\\").unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(!bytes.starts_with(&[0xEF, 0xBB, 0xBF]), "stays GBK (no BOM)");
+        let (dec, _, had_errors) = encoding_rs::GBK.decode(&bytes);
+        assert!(!had_errors);
+        assert!(dec.contains("abc\\"), "roundtrips: {:?}", dec);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

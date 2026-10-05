@@ -55,6 +55,13 @@ if (-not $sz) { Write-Output 'SKIP: 7z.exe not found - cannot build fixtures'; e
 Write-Output ("7z: " + $sz)
 if ($rar) { Write-Output ("rar: " + $rar) } else { Write-Output 'rar.exe not found: RAR5 fixtures will be skipped' }
 
+# Pin the fallback tool for the whole suite: ToolLocator prefers the
+# DICTCRACK_TOOL environment variable, so a user-set variable pointing at
+# rar.exe would silently move the 7z-fixture spawn tests (19-21) onto the
+# CRT-argv quoting path and test something else than the comments claim.
+$oldTool = $env:DICTCRACK_TOOL
+$env:DICTCRACK_TOOL = $sz
+
 # ---- protect the user's GUI cfg ---------------------------------------
 $cfgBak = $null
 if (Test-Path $cfg) {
@@ -98,6 +105,9 @@ try {
     [System.IO.File]::WriteAllBytes((Join-Path $tmp 'payload.txt'), $pb)
 
     # ---- fixtures ----------------------------------------------------
+    # rar.exe is a standard CRT argv program, so PowerShell's own argument
+    # quoting produces the command line it expects; only 7z.exe parses the
+    # raw line itself and needs the ProcessStartInfo route (New-7zRaw below)
     function New-Rar([string]$name, [string]$pw, [bool]$hp) {
         $a = Join-Path $script:tmp $name
         if ($hp) { & $script:rar a -ep -ma5 "-hp$pw" $a (Join-Path $script:tmp 'payload.txt') | Out-Null }
@@ -114,6 +124,23 @@ try {
     function New-7z([string]$name, [string]$pw) {
         $a = Join-Path $script:tmp $name
         & $script:sz a "-p$pw" $a (Join-Path $script:tmp 'payload.txt') | Out-Null
+        if (-not (Test-Path $a)) { throw "failed to create $a" }
+        return $a
+    }
+    function New-7zRaw([string]$name, [string]$pw) {
+        # a password containing quotes cannot go through PowerShell's native
+        # argument encoding (PS rewrites " to \"), but 7z.exe parses the raw
+        # command line itself ("" collapses to one quote), so build that line
+        # directly - same rules WinArg.SimpleQuote applies on the crack side
+        $a = Join-Path $script:tmp $name
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $script:sz
+        $psi.Arguments = 'a -y -p' + ($pw -replace '"', '""') + ' "' + $a + '" "' + (Join-Path $script:tmp 'payload.txt') + '"'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $p.WaitForExit()
+        if ($p.ExitCode -ne 0) { throw ("7z exited " + $p.ExitCode + " while creating " + $a) }
         if (-not (Test-Path $a)) { throw "failed to create $a" }
         return $a
     }
@@ -351,7 +378,67 @@ try {
     if ($code -eq 0 -and $got -eq 'endbs\') { Pass 'test 19' }
     else { Fail 'test 19' ("exit=" + $code + " got='" + $got + "'") }
 
+    # ---- test 20: spawn path survives quote+backslash passwords --------
+    # 7z doubling form: "" arrives as one quote, a trailing backslash stays
+    # literal. CRT-style or wrongly-doubled escaping turns pw"q\ into
+    # pw""q\ / pw"q\\ and silently misses the hit. Covers the verify spawn
+    # path with the same hostile alphabet as test 19 plus a real quote.
+    Write-Output 'test 20: external-tool path with quote+backslash password'
+    $qZip = New-7zRaw 'q.7z' 'pw"q\'
+    $d = Write-Dict 'd20.txt' @('wrong', 'pw"q\')
+    Remove-Result $qZip
+    $code = Run-Cli crack -a $qZip -w $d -q
+    $got = Read-Result $qZip
+    if ($code -eq 0 -and $got -eq 'pw"q\') { Pass 'test 20' }
+    else { Fail 'test 20' ("exit=" + $code + " got='" + $got + "'") }
+
+    # ---- test 21: --extract-to with the same hostile password ----------
+    # covers the hit-time extract path's per-tool quoting of -p<password>,
+    # -o<dir> (a directory name containing a space) and the archive path;
+    # a regression here corrupts the unpacked output silently
+    Write-Output 'test 21: --extract-to unpacks with quote+backslash password'
+    $exDir = Join-Path $tmp 'ex dir'
+    Remove-Item -LiteralPath $exDir -Recurse -Force -ErrorAction SilentlyContinue
+    $code = Run-Cli crack -a $qZip -w (Write-Dict 'd21.txt' @('pw"q\')) -q --extract-to $exDir
+    $extracted = Join-Path $exDir 'payload.txt'
+    $okEx = (Test-Path $extracted) -and ((Get-Item $extracted).Length -eq 262144)
+    if ($code -eq 0 -and $okEx) { Pass 'test 21' }
+    else { Fail 'test 21' ("exit=" + $code + " extracted=" + $okEx) }
+
+    # ---- test 22: open_error parity -- missing path / directory -------
+    # C# File.Exists semantics: a directory takes the "not found" branch,
+    # and every entry point exits 2 instead of crashing or reporting an
+    # unknown format with exit 0 (the pre-open_error Rust behavior)
+    Write-Output 'test 22: missing/directory archive exits 2 on info/bench/crack'
+    $noDir = Join-Path $tmp 'no-such-dir'
+    $d22 = Write-Dict 'd22.txt' @('x')
+    $cInfo = Run-Cli info $noDir
+    $cCrack = Run-Cli crack -a $noDir -w $d22 -q
+    $cBench = Run-Cli bench -a $noDir
+    if ($cInfo -eq 2 -and $cCrack -eq 2 -and $cBench -eq 2) { Pass 'test 22' }
+    else { Fail 'test 22' ("info=" + $cInfo + " crack=" + $cCrack + " bench=" + $cBench) }
+
+    # ---- test 23: open_error parity -- locked (unreadable) file -------
+    # a file held open with FileShare.None must hit the readable-error
+    # branch and exit 2 on info AND bench (bench died on an unhandled Parse
+    # exception before the fix) and on crack, never a silent exit 0
+    Write-Output 'test 23: locked archive exits 2 on info/bench/crack'
+    $locked = Join-Path $tmp 'locked.zip'
+    Copy-Item $za $locked
+    $fs = [System.IO.File]::Open($locked, 'Open', 'Read', 'None')
+    try {
+        $cInfo = Run-Cli info $locked
+        $cBench = Run-Cli bench -a $locked
+        $cCrack = Run-Cli crack -a $locked -w (Write-Dict 'd23.txt' @('x')) -q
+    } finally {
+        if ($fs) { $fs.Close() }
+    }
+    if ($cInfo -eq 2 -and $cBench -eq 2 -and $cCrack -eq 2) { Pass 'test 23' }
+    else { Fail 'test 23' ("info=" + $cInfo + " bench=" + $cBench + " crack=" + $cCrack) }
+
 } finally {
+    if ($null -ne $oldTool) { $env:DICTCRACK_TOOL = $oldTool }
+    else { Remove-Item Env:\DICTCRACK_TOOL -ErrorAction SilentlyContinue }
     # kill any surviving GUI processes started by the tests
     Get-CimInstance Win32_Process -Filter "Name = 'dictcrack-gui.exe'" -ErrorAction SilentlyContinue |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

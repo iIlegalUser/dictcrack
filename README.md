@@ -40,6 +40,36 @@ Windows 下的压缩包密码恢复工具。核心是 **C# 原生验证引擎**�
 3. **ZipCrypto 误报**：1 字节检查值有 1/256 误报率，命中后再做全量解密+解压+CRC
    校验，保证报出的密码一定正确。
 
+## 环境要求
+
+- Windows 7 / Server 2008 R2 或更高（原生 PBKDF2 走系统 CNG `bcrypt.dll`）。
+- 运行无需安装 .NET（Windows 8+ 系统自带 .NET Framework 4.x），编译用系统自带
+  的 csc（见下）。无任何第三方依赖。
+- 仅外部工具回退路径（RAR 4.x / 7z 等）需要 7-Zip 的 `7z.exe` 或 WinRAR 的
+  `rar.exe`，可用 `--tool` 或环境变量 `DICTCRACK_TOOL` 指定；原生路径
+  （RAR5 / 加密 ZIP）完全不需要。
+
+## Rust 重写版（CLI 引擎）
+
+`rust\` 下是核心破解引擎的 Rust 重写（GUI 不在内，GUI 仍用 C# 版）：
+零运行时、单 exe 静态分发，行为与 C# 版逐点对齐（CLI 契约、session.json
+双向续跑、魔法常量、GBK 结果文件编码），三条原生路径性能全面超过 C# 版
+（RAR5 约 2.9×、ZIP AES 约 7.6×、ZipCrypto 约 4.0×，详见
+`docs\superpowers\specs\` 下的设计文档与验收报告）。
+
+```powershell
+cd rust
+cargo build --release   # 产出 rust\target\x86_64-pc-windows-gnu\release\dictcrack.exe
+cargo test              # 单元测试（PBKDF2 向量 / ZIP64 合成样本 / 各源与转义矩阵）
+```
+
+工具链为 `x86_64-pc-windows-gnu`（`rust\.cargo\config.toml` 已钉死，任意机器
+行为一致）；产物单 exe 静态链接，无外部 DLL 依赖。用 e2e 套件验收 Rust 版：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1 -ExePath rust\target\x86_64-pc-windows-gnu\release\dictcrack.exe
+```
+
 ## 构建
 
 无第三方依赖，用系统自带 .NET Framework 4.8 编译器：
@@ -77,6 +107,10 @@ dictcrack bench -a <压缩包>   # 基准测速（需要 RAR5 或加密 ZIP）
 `--tool <exe>`（后备验证工具路径，也可用环境变量 `DICTCRACK_TOOL` 指定
 7z.exe/rar.exe）、`-q`（静默）。字典可给多个 `-w`，`-w -` 从标准输入读入。
 退出码：`0` 找到密码，`1` 未找到，`2` 出错，`3` 已停止（可 `--resume`）。
+被占用 / 无权限的压缩包是一等错误：`info`/`bench` 报
+「无法读取该文件（可能被占用或权限不足）」并 exit 2，`crack` 报
+「解析压缩包失败: …」exit 2，不会静默当作未知格式；目录按 `File.Exists`
+语义报「文件不存在」。
 
 变异规则按选择顺序**链式叠加**：每个预设也会变异前面预设的输出，如
 `--rule years,digits` 会产出 `词+年份` 与 `词+年份+数字` 两层形态，覆盖
@@ -154,12 +188,34 @@ run-tests.ps1 需要 7-Zip 与 WinRAR 的 `rar.exe`（RAR 7 已不能生成 RAR4
 UTF-16LE / GBK 中文密码矩阵、断点续跑、基准、GUI 自动启动。
 
 unit-tests.ps1 把引擎源码与 unittests.cs 编译成独立程序集直接跑，覆盖 PBKDF2
-已知向量、会话序列化往返、ZIP64 合成样本、掩码/规则/行切分/编码计划等。
+已知向量、会话序列化往返、ZIP64 合成样本（含 >65535 条目回归）、掩码/规则/
+行切分/编码计划、结果文件编码策略、外部工具参数转义等。
+
+## 运行期生成的文件
+
+所有生成物都落在 exe 所在目录，不往系统其他位置写文件：
+
+| 文件 | 说明 |
+|---|---|
+| `session.json` | 断点续跑会话（进度 + 参数指纹），命中/跑完自动删除 |
+| `<压缩包名>_password.txt` | 默认结果文件（可用 `--out` 改路径） |
+| `dictcrack-gui.cfg` | GUI 记住的上次输入（含个人路径，已在 .gitignore 排除） |
+
+结果文件编码：优先显式 GBK(936)（中文环境记事本直接可读），但先做无损校验，
+GBK 表示不了的密码（emoji、生僻字等）自动改写 UTF-8 with BOM；从不依赖机器
+的 `Encoding.Default`，en-US 等 CI 区域不会写坏中文密码。
+
+## 合规与授权
+
+本工具仅用于**已获得明确授权**的口令审计、密码恢复测试与安全学习场景（例如
+恢复自己的档案、企业内部获授权的口令强度评估）。对未授权的账户/档案使用本
+工具可能违反当地法律；使用者需自行承担合规责任。
 
 ## 已知限制
 
 - 纯 CPU：RAR5 的 PBKDF2（默认 2^15 轮）是格式强制的，有 GPU 请用 hashcat
   （`dictcrack info <压缩包> --hashcat` 可直接导出 hashcat -m 13000 格式 hash）。
-- 外部工具回退路径的候选不能含换行/引号（命令行传参限制）；原生路径无此限制。
+- 外部工具回退路径的候选不能含换行（\r/\n 会被跳过）；引号、反斜杠、空格等
+  特殊字符已做完整的命令行转义，原生路径无任何字符限制。
 - 组合攻击会把字典 B 整体载入内存。
 - RAR 1.5-4.x 仍走外部工具回退，RAR4 原生化未实现。

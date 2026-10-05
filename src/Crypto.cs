@@ -58,6 +58,12 @@ namespace DictCrack
         // the managed fallback permanent; a failed derive call is transient
         // (previously any single failure downgraded the whole run to the
         // several-times-slower managed implementation).
+        /// <summary>
+        /// PBKDF2-HMAC-SHA256 via CNG (one algorithm handle per thread -
+        /// a shared handle is serialised inside BCryptDeriveKeyPBKDF2),
+        /// transparently falling back to Rfc2898DeriveBytes if CNG is
+        /// unavailable. Results match the RFC 6070/7914 test vectors.
+        /// </summary>
         public static byte[] Pbkdf2Sha256(byte[] pwd, byte[] salt, long iterations, int bytes)
         {
             if (!_initFailed)
@@ -69,6 +75,10 @@ namespace DictCrack
                 return d.GetBytes(bytes);
         }
 
+        /// <summary>
+        /// PBKDF2-HMAC-SHA1 via CNG, same per-thread handle / managed
+        /// fallback contract as Pbkdf2Sha256; used by the WinZip-AES path.
+        /// </summary>
         public static byte[] Pbkdf2Sha1(byte[] pwd, byte[] salt, long iterations, int bytes)
         {
             if (!_initFailed)
@@ -83,6 +93,11 @@ namespace DictCrack
         public static byte[] Sha256(byte[] data) { using (var h = SHA256.Create()) return h.ComputeHash(data); }
     }
 
+    /// <summary>
+    /// Standard CRC-32 (poly 0xEDB88320, reflected, pre/post inverted).
+    /// Used for the ZIP uncompressed-data confirm and shared with the
+    /// ZipCrypto key schedule via RawStep.
+    /// </summary>
     internal static class Crc32
     {
         private static readonly uint[] Table = BuildTable();
@@ -99,6 +114,7 @@ namespace DictCrack
             return t;
         }
 
+        /// <summary>Continues a CRC over buf[offset, offset+count).</summary>
         public static uint Update(uint crc, byte[] buf, int offset, int count)
         {
             uint c = crc ^ 0xFFFFFFFFu;

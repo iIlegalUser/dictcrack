@@ -2,11 +2,20 @@
 use clap::{Parser, Subcommand};
 use dictcrack_core::archive::{self, ArchiveKind};
 use dictcrack_core::engine::{self, CrackConfig, CrackEngine};
+use dictcrack_core::tool::{ToolLocator, WinArg};
 use dictcrack_core::verifier;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+// console-aware output macros (out!/outln!/err!/errln!) must be in scope
+// before any call site below
+#[macro_use]
+mod console;
 
 #[derive(Parser)]
 #[command(name = "dictcrack", version, about = "DictCrack - 压缩包密码字典/掩码破解工具（原生引擎）", long_about = None)]
@@ -98,86 +107,100 @@ enum Commands {
     },
 }
 
+// File.Exists in C# is "exists and is a regular file": a directory must
+// take the same "文件不存在" branch the C# frontend reports.
+fn path_missing(p: &Path) -> bool {
+    !p.exists() || p.is_dir()
+}
+
 fn cmd_info(archive_path: &str, hashcat: bool) -> i32 {
-    if !Path::new(archive_path).exists() {
-        eprintln!("文件不存在: {}", archive_path);
+    if path_missing(Path::new(archive_path)) {
+        errln!("文件不存在: {}", archive_path);
         return 2;
     }
     let info = archive::parse(archive_path);
+    if let Some(err) = &info.open_error {
+        errln!("无法读取该文件（可能被占用或权限不足）: {}", err);
+        return 2;
+    }
     let full = std::fs::canonicalize(archive_path)
         .map(|p| {
             let s = p.display().to_string();
             s.strip_prefix(r"\\?\").map(|x| x.to_string()).unwrap_or(s)
         })
         .unwrap_or_else(|_| archive_path.to_string());
-    println!("文件: {}", full);
+    outln!("文件: {}", full);
     let size = std::fs::metadata(archive_path).map(|m| m.len()).unwrap_or(0);
-    println!("大小: {} 字节", size);
+    outln!("大小: {} 字节", size);
     match info.kind {
         ArchiveKind::Rar5 => {
-            println!("格式: RAR 5.x");
+            outln!("格式: RAR 5.x");
             match &info.rar5 {
-                None => println!("加密: 无（未发现加密头记录）"),
+                None => outln!("加密: 无（未发现加密头记录）"),
                 Some(r) => {
-                    println!("加密: {}", if r.header_encrypted { "RAR5 头加密（-hp）" } else { "RAR5 文件数据加密" });
+                    outln!("加密: {}", if r.header_encrypted { "RAR5 头加密（-hp）" } else { "RAR5 文件数据加密" });
                     if let Some(n) = &r.entry_name {
-                        println!("目标条目: {}", n);
+                        outln!("目标条目: {}", n);
                     }
-                    println!("KDF: PBKDF2-HMAC-SHA256, {} 轮", 1u64 << r.lg2_count);
-                    println!("密码校验: {}", if r.psw_check.is_some() { "有（可原生快速验证）" } else { "无（回退外部工具）" });
+                    outln!("KDF: PBKDF2-HMAC-SHA256, {} 轮", 1u64 << r.lg2_count);
+                    outln!("密码校验: {}", if r.psw_check.is_some() { "有（可原生快速验证）" } else { "无（回退外部工具）" });
                     if hashcat {
                         if r.psw_check.is_some() {
-                            println!("Hashcat (-m 13000): {}", archive::hashcat_rar5(r));
+                            outln!("Hashcat (-m 13000): {}", archive::hashcat_rar5(r));
                         } else {
-                            println!("Hashcat: 该压缩包没有可导出的校验数据");
+                            outln!("Hashcat: 该压缩包没有可导出的校验数据");
                         }
                     }
                 }
             }
         }
-        ArchiveKind::RarLegacy => println!("格式: RAR 1.5-4.x"),
+        ArchiveKind::RarLegacy => outln!("格式: RAR 1.5-4.x"),
         ArchiveKind::Zip => {
-            println!("格式: ZIP");
+            outln!("格式: ZIP");
             match &info.zip {
-                None => println!("加密: 未检测到加密条目"),
+                None => outln!("加密: 未检测到加密条目"),
                 Some(z) => {
-                    println!("目标条目: {}", z.name);
-                    println!(
+                    outln!("目标条目: {}", z.name);
+                    outln!(
                         "加密方式: {}",
                         if z.aes { format!("WinZip AES-{}", z.aes_strength as u32 * 64 + 64) } else { "传统 ZipCrypto".to_string() }
                     );
                 }
             }
         }
-        ArchiveKind::SevenZip => println!("格式: 7z"),
-        ArchiveKind::Unknown => println!("格式: 无法识别（{}）", info.detect_note),
+        ArchiveKind::SevenZip => outln!("格式: 7z"),
+        ArchiveKind::Unknown => outln!("格式: 无法识别（{}）", info.detect_note),
     }
-    println!("验证路径: {}", if info.native_supported() { "原生引擎 (native)" } else { "外部工具 (external)" });
+    outln!("验证路径: {}", if info.native_supported() { "原生引擎 (native)" } else { "外部工具 (external)" });
     0
 }
 
 fn cmd_bench(archive_path: &str, threads: u32, seconds: u32) -> i32 {
-    if !Path::new(archive_path).exists() {
-        eprintln!("文件不存在: {}", archive_path);
+    if path_missing(Path::new(archive_path)) {
+        errln!("文件不存在: {}", archive_path);
         return 2;
     }
     let info = archive::parse(archive_path);
+    if let Some(err) = &info.open_error {
+        errln!("无法读取该文件（可能被占用或权限不足）: {}", err);
+        return 2;
+    }
     if !info.native_supported() {
-        eprintln!("该压缩包不支持原生验证（{}），基准测速需要 RAR5 或加密 ZIP。", info.detect_note);
+        errln!("该压缩包不支持原生验证（{}），基准测速需要 RAR5 或加密 ZIP。", info.detect_note);
         return 2;
     }
     let v: Arc<dyn verifier::Verifier + Send + Sync> = match verifier::create_native(&info, archive_path) {
         Some(v) => v.into(),
         None => {
-            eprintln!("无法创建原生验证器。");
+            errln!("无法创建原生验证器。");
             return 2;
         }
     };
-    println!("{}", v.describe());
+    outln!("{}", v.describe());
     let single = engine::bench_measure(&v, 1, seconds);
-    println!("单线程: {:.1} 个/秒", single);
+    outln!("单线程: {:.1} 个/秒", single);
     let all = engine::bench_measure(&v, threads, seconds);
-    println!(
+    outln!(
         "{}: {:.1} 个/秒",
         if threads > 0 { format!("{} 线程", threads) } else { "自动线程".to_string() },
         all
@@ -220,6 +243,7 @@ fn cmd_crack(
     extract_to: Option<String>,
     resume: bool,
     no_checkpoint: bool,
+    last_checkpoint: Option<bool>,
     dedupe: bool,
     quiet: bool,
 ) -> i32 {
@@ -231,7 +255,7 @@ fn cmd_crack(
         "dict".to_string()
     };
     if mode == "dict" && dicts.is_empty() {
-        eprintln!("错误: 字典模式需要 -w <字典文件>（或使用 --mask）。");
+        errln!("错误: 字典模式需要 -w <字典文件>（或使用 --mask）。");
         return 2;
     }
     let presets: Vec<String> = rule
@@ -257,7 +281,10 @@ fn cmd_crack(
         mask_min: min,
         mask_max: max,
         threads,
-        checkpoint_enabled: !no_checkpoint,
+        // C# ParseCrackArgs applies --resume/--no-checkpoint in argv order
+        // (the last one wins); last_checkpoint carries that order, defaulting
+        // to the flags' plain semantics when neither appears
+        checkpoint_enabled: last_checkpoint.unwrap_or(!no_checkpoint),
         resume_requested: resume,
         max_tries,
         user_tool: tool,
@@ -272,19 +299,18 @@ fn cmd_crack(
     let _ = ctrlc_set_handler(move || {
         static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if COUNT.fetch_add(1, Ordering::SeqCst) >= 1 {
-            eprintln!("强制退出。");
+            errln!("强制退出。");
             std::process::exit(3);
         }
         cancel2.store(true, Ordering::SeqCst);
-        eprintln!("... 正在停止（再次 Ctrl+C 强制退出）");
+        errln!("... 正在停止（再次 Ctrl+C 强制退出）");
     });
 
-    println!("DictCrack 原生引擎 v1.0");
+    outln!("DictCrack 原生引擎 v1.0");
     let engine = CrackEngine::new(cfg.clone());
     let stats = engine.stats.clone();
 
     // progress printer thread
-    let progress_cancel = cancel.clone();
     let progress = if quiet {
         None
     } else {
@@ -329,8 +355,7 @@ fn cmd_crack(
                 if line.chars().count() > 110 {
                     line = line.chars().take(110).collect();
                 }
-                print!("\r{:<width$}\r", line, width = 118);
-                let _ = progress_cancel;
+                out!("\r{:<width$}\r", line, width = 118);
             }
         }))
     };
@@ -341,37 +366,37 @@ fn cmd_crack(
     }
 
     if let Some(e) = &res.error {
-        eprintln!("错误: {}", e);
+        errln!("错误: {}", e);
         return 2;
     }
     if let Some(w) = &res.warning {
-        eprintln!("警告: {}", w);
+        errln!("警告: {}", w);
     }
     let rate = if res.elapsed_sec > 0.2 { res.tried as f64 / res.elapsed_sec } else { 0.0 };
     if res.found {
-        println!();
-        println!("=== 找到密码: {} ===", res.password);
-        println!("尝试 {} 个, 用时 {}, 平均 {:.1} 个/秒", res.tried, format_time(res.elapsed_sec), rate);
+        outln!();
+        outln!("=== 找到密码: {} ===", res.password);
+        outln!("尝试 {} 个, 用时 {}, 平均 {:.1} 个/秒", res.tried, format_time(res.elapsed_sec), rate);
         if let Some(f) = &res.result_file {
-            println!("结果已保存: {}", f);
+            outln!("结果已保存: {}", f);
         }
-        if extract_to.is_some() {
-            eprintln!("提示: --extract-to 依赖 7z.exe，外部工具集成在 M4 实现；密码已给出。");
+        if let Some(dir) = extract_to {
+            return do_extract(&archive, &res.password, &dir);
         }
         return 0;
     }
     if res.cancelled {
-        println!("已取消（进度已保存, 下次加 --resume 继续）。");
+        outln!("已取消（进度已保存, 下次加 --resume 继续）。");
         return 3;
     }
     if res.maxed_out {
-        println!("达到 --max-tries 上限, 已停止（进度已保存, 加 --resume 继续）。");
+        outln!("达到 --max-tries 上限, 已停止（进度已保存, 加 --resume 继续）。");
         return 3;
     }
-    println!();
+    outln!();
     let note = engine.log_note.lock().unwrap().clone();
-    println!("未找到密码。{}", if !note.is_empty() { format!("（编码方案: {}）", note) } else { String::new() });
-    println!("共尝试 {} 个, 用时 {}, 平均 {:.1} 个/秒", res.tried, format_time(res.elapsed_sec), rate);
+    outln!("未找到密码。{}", if !note.is_empty() { format!("（编码方案: {}）", note) } else { String::new() });
+    outln!("共尝试 {} 个, 用时 {}, 平均 {:.1} 个/秒", res.tried, format_time(res.elapsed_sec), rate);
     1
 }
 
@@ -400,26 +425,189 @@ fn ctrlc_set_handler<F: Fn() + Send + Sync + 'static>(f: F) -> Result<(), ()> {
     Err(())
 }
 
+// ------------------------------------------------------------------
+// --extract-to: after a hit, unpack with 7z.exe/rar.exe. Port of Cli.DoExtract:
+// `x -y -p<pwd> -o<dir> <archive>` with per-tool quoting (7z self-parses the
+// raw line, rar.exe is a CRT argv program - see tool::WinArg).
+fn do_extract(archive: &str, password: &str, dir: &str) -> i32 {
+    let tool = match ToolLocator::find_extractor() {
+        Some(t) => t,
+        None => {
+            errln!("错误: 找不到 7z.exe, 无法解压。");
+            return 2;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        // C# DoExtract lets Directory.CreateDirectory throw (an unhandled
+        // crash); report the real cause instead of blaming the extractor
+        errln!("错误: 无法创建目录 {}: {}", dir, e);
+        return 2;
+    }
+    outln!("正在解压到 {} ...", dir);
+    let status = std::process::Command::new(&tool)
+        .arg("x")
+        .arg("-y")
+        .raw_arg(format!("-p{}", WinArg::quote_for_tool(&tool, password)))
+        .raw_arg(format!("-o{}", WinArg::quote_for_tool(&tool, dir)))
+        .raw_arg(WinArg::quote_for_tool(&tool, archive))
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            outln!("解压完成。");
+            0
+        }
+        Ok(s) => {
+            outln!("解压失败（退出码 {}）。", s.code().unwrap_or(-1));
+            2
+        }
+        Err(e) => {
+            outln!("解压失败（{}）。", e);
+            2
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// The C# frontend warns about and IGNORES unrecognized options
+// (ParseCrackArgs) instead of failing; anything that is not info/bench/help
+// even runs the crack parser without a subcommand. clap hard-errors on both,
+// so pre-scan the crack argv: drop unknown "-..." tokens with the same
+// warning, drop stray positionals (C# silently ignores them), and inject the
+// implicit "crack" subcommand.
+const OPTS_WITH_VALUE: &[&str] = &[
+    "-a", "--archive", "-w", "--dict", "--w2", "--rule", "--rules", "--mask", "-m",
+    "-1", "-2", "-3", "-4", "--min", "--max", "-t", "--threads", "--max-tries",
+    "--tool", "--out", "--extract-to",
+];
+const OPT_FLAGS: &[&str] = &["--resume", "--no-checkpoint", "-q", "--quiet", "--dedupe"];
+
+fn normalize_w2(s: &str) -> String {
+    if s == "-w2" {
+        "--w2".to_string()
+    } else if let Some(rest) = s.strip_prefix("-w2=") {
+        format!("--w2={}", rest)
+    } else {
+        s.to_string()
+    }
+}
+
+fn is_recognized(token: &str) -> Option<bool> {
+    // Some(true): recognized with a value; Some(false): flag; None: unknown
+    let t = normalize_w2(token);
+    if OPTS_WITH_VALUE.contains(&t.as_str()) {
+        return Some(true);
+    }
+    if OPT_FLAGS.contains(&t.as_str()) {
+        return Some(false);
+    }
+    if OPTS_WITH_VALUE.iter().any(|n| t.starts_with(&format!("{}=", n))) {
+        return Some(false); // attached-value form, e.g. --out=x.rar
+    }
+    None
+}
+
+/// Rewrites the crack invocation the way C# would parse it:
+/// unknown "-..." options warn and get dropped, stray positionals are
+/// silently dropped, and the leading "crack" may be implicit.
+fn crack_argv(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    // decide the subcommand like C# Main does
+    let first = args.get(1).and_then(|a| a.to_str()).map(|s| s.to_lowercase());
+    let pass_through = matches!(
+        first.as_deref(),
+        Some("info") | Some("bench") | Some("help") | Some("--help") | Some("-h") | Some("--version") | Some("-v")
+    ) || args.len() <= 1;
+    if pass_through {
+        return args;
+    }
+    // tokens after the (optional, dropped) "crack" subcommand word
+    let rest: Vec<std::ffi::OsString> = if first.as_deref() == Some("crack") {
+        args.into_iter().skip(2).collect()
+    } else {
+        args.into_iter().skip(1).collect()
+    };
+
+    let mut out = vec![std::ffi::OsString::from("dictcrack"), std::ffi::OsString::from("crack")];
+    let mut skip_next = false; // next token is a consumed option value
+    for a in rest {
+        if skip_next {
+            out.push(a);
+            skip_next = false;
+            continue;
+        }
+        let s = a.to_string_lossy().into_owned();
+        if s.len() > 1 && s.starts_with('-') {
+            match is_recognized(&s) {
+                Some(true) => {
+                    out.push(a);
+                    skip_next = true;
+                }
+                Some(false) => out.push(a),
+                None => errln!("警告: 无法识别的选项 {}（已忽略）", s),
+            }
+        }
+        // else: a stray positional (or a bare "-"): C# silently ignores it
+    }
+    out
+}
+
+/// Recovers the C# argv-order semantics of --resume/--no-checkpoint (the
+/// last flag wins; `--resume` implies checkpointing on). Scans the rewritten
+/// crack argv and skips option *values*: C# consumes "-a --resume" as the
+/// archive value, so a flag-looking token in value position must not count.
+fn last_checkpoint(args: &[std::ffi::OsString]) -> Option<bool> {
+    let mut last: Option<bool> = None;
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        match a.to_str() {
+            Some("--resume") => last = Some(true),
+            Some("--no-checkpoint") => last = Some(false),
+            Some(s) if is_recognized(s) == Some(true) => skip_next = true,
+            _ => {}
+        }
+    }
+    last
+}
+
 fn main() {
     // clap cannot express the single-dash multi-char option "-w2" (the C#
     // combinator flag); rewrite it to the long form "--w2" before parsing so
     // the CLI contract stays byte-compatible with the C# frontend.
     let args: Vec<std::ffi::OsString> = std::env::args_os()
         .map(|a| {
-            if a == "-w2" {
-                std::ffi::OsString::from("--w2")
-            } else if let Some(s) = a.to_str() {
-                if let Some(rest) = s.strip_prefix("-w2=") {
-                    std::ffi::OsString::from(format!("--w2={}", rest))
-                } else {
-                    a.clone()
-                }
-            } else {
-                a.clone()
+            let s = a.to_str().map(|s| s.to_string());
+            match s.as_deref().map(normalize_w2) {
+                Some(n) if n != a.to_string_lossy() => std::ffi::OsString::from(n),
+                _ => a,
             }
         })
         .collect();
-    let cli = Cli::parse_from(args);
+    let args = crack_argv(args);
+    // clap loses the argv order of the --resume / --no-checkpoint flags, but
+    // the C# frontend applies them in order, so the last one decides
+    // whether the session file is written; recover that order here
+    let checkpoint_order = last_checkpoint(&args);
+    let cli = match Cli::try_parse_from(args) {
+        Ok(c) => c,
+        Err(e) => {
+            // clap writes its rendered text straight to stderr/stdout, which
+            // would mojibake the Chinese help on a CP936 console; route it
+            // through the same console-aware writers
+            let mut text = e.render().to_string();
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            if e.use_stderr() {
+                err!("{}", text);
+            } else {
+                out!("{}", text);
+            }
+            std::process::exit(e.exit_code());
+        }
+    };
     let code = match cli.command {
         Some(Commands::Info { archive, hashcat }) => cmd_info(&archive, hashcat),
         Some(Commands::Bench { archive, threads, seconds }) => cmd_bench(&archive, threads, seconds),
@@ -428,12 +616,134 @@ fn main() {
             max_tries, tool, out, extract_to, resume, no_checkpoint, dedupe, quiet,
         }) => cmd_crack(
             archive, dicts, dict_b, rule, mask, c1, c2, c3, c4, min, max, threads,
-            max_tries, tool, out, extract_to, resume, no_checkpoint, dedupe, quiet,
+            max_tries, tool, out, extract_to, resume, no_checkpoint, checkpoint_order, dedupe, quiet,
         ),
         None => {
-            eprintln!("用法见 dictcrack --help");
+            errln!("用法见 dictcrack --help");
             2
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn os(v: &[&str]) -> Vec<std::ffi::OsString> {
+        v.iter().map(|s| std::ffi::OsString::from(*s)).collect()
+    }
+
+    #[test]
+    fn normalize_w2_forms() {
+        assert_eq!(normalize_w2("-w2"), "--w2");
+        assert_eq!(normalize_w2("-w2=d.txt"), "--w2=d.txt");
+        assert_eq!(normalize_w2("--w2"), "--w2");
+        // lookalikes stay untouched (C# TryOpt matches "-w2"/"-w2=" exactly)
+        assert_eq!(normalize_w2("-w"), "-w");
+        assert_eq!(normalize_w2("-w22"), "-w22");
+        assert_eq!(normalize_w2("--dict"), "--dict");
+    }
+
+    #[test]
+    fn is_recognized_matrix() {
+        // value-taking options
+        for t in [
+            "-a", "--archive", "-w", "--dict", "--w2", "--rule", "--rules", "--mask", "-m",
+            "-1", "-2", "-3", "-4", "--min", "--max", "-t", "--threads", "--max-tries",
+            "--tool", "--out", "--extract-to",
+        ] {
+            assert_eq!(is_recognized(t), Some(true), "{} takes a value", t);
+        }
+        // flags
+        for t in ["--resume", "--no-checkpoint", "-q", "--quiet", "--dedupe"] {
+            assert_eq!(is_recognized(t), Some(false), "{} is a flag", t);
+        }
+        // attached-value form: recognized, but consumes no following token
+        assert_eq!(is_recognized("--out=x.rar"), Some(false));
+        assert_eq!(is_recognized("--w2=d.txt"), Some(false));
+        assert_eq!(is_recognized("--mask=ab?d"), Some(false));
+        // unknown -> the C# warning-and-ignore path
+        for t in ["--masi", "-v", "-x", "-w22", "--dictx", "-"] {
+            assert_eq!(is_recognized(t), None, "{} unknown", t);
+        }
+    }
+
+    #[test]
+    fn crack_argv_rewrites_implicit_crack_and_drops_junk() {
+        // no subcommand -> implicit "crack"; unknown options warn and are
+        // dropped; stray positionals are silently dropped
+        assert_eq!(
+            crack_argv(os(&["dictcrack", "--masi", "-a", "x.rar", "-w", "d.txt", "junk"])),
+            os(&["dictcrack", "crack", "-a", "x.rar", "-w", "d.txt"])
+        );
+        // explicit "crack" is consumed exactly once
+        assert_eq!(
+            crack_argv(os(&["dictcrack", "crack", "-a", "x.rar", "-q"])),
+            os(&["dictcrack", "crack", "-a", "x.rar", "-q"])
+        );
+    }
+
+    #[test]
+    fn crack_argv_values_may_look_like_options() {
+        // an option value is consumed even if it starts with "-"
+        assert_eq!(
+            crack_argv(os(&["dictcrack", "crack", "-a", "-weird.rar", "-q"])),
+            os(&["dictcrack", "crack", "-a", "-weird.rar", "-q"])
+        );
+        // attached-value options consume nothing
+        assert_eq!(
+            crack_argv(os(&["dictcrack", "crack", "--out=x.rar", "--mask=ab?d", "-q"])),
+            os(&["dictcrack", "crack", "--out=x.rar", "--mask=ab?d", "-q"])
+        );
+    }
+
+    #[test]
+    fn crack_argv_passes_through_non_crack_invocations() {
+        assert_eq!(crack_argv(os(&["dictcrack", "info", "x.rar"])), os(&["dictcrack", "info", "x.rar"]));
+        assert_eq!(
+            crack_argv(os(&["dictcrack", "bench", "-a", "x.rar"])),
+            os(&["dictcrack", "bench", "-a", "x.rar"])
+        );
+        assert_eq!(crack_argv(os(&["dictcrack", "--help"])), os(&["dictcrack", "--help"]));
+        assert_eq!(crack_argv(os(&["dictcrack", "-h"])), os(&["dictcrack", "-h"]));
+        assert_eq!(crack_argv(os(&["dictcrack", "--version"])), os(&["dictcrack", "--version"]));
+        assert_eq!(crack_argv(os(&["dictcrack"])), os(&["dictcrack"]));
+    }
+
+    #[test]
+    fn last_checkpoint_last_flag_wins() {
+        // the C# frontend applies both flags in argv order: last one decides
+        assert_eq!(last_checkpoint(&os(&["--resume"])), Some(true));
+        assert_eq!(last_checkpoint(&os(&["--no-checkpoint"])), Some(false));
+        assert_eq!(last_checkpoint(&os(&["--resume", "--no-checkpoint"])), Some(false));
+        assert_eq!(last_checkpoint(&os(&["--no-checkpoint", "--resume"])), Some(true));
+        assert_eq!(last_checkpoint(&os(&["-a", "x.rar", "-w", "d.txt"])), None);
+        assert_eq!(last_checkpoint(&os(&[])), None);
+    }
+
+    #[test]
+    fn last_checkpoint_skips_option_values() {
+        // "-a --resume" consumes "--resume" as the archive value: C# never
+        // sees a flag there, so neither may the pre-scan
+        assert_eq!(last_checkpoint(&os(&["-a", "--resume", "-w", "d.txt"])), None);
+        assert_eq!(
+            last_checkpoint(&os(&["-a", "x.rar", "--out=--resume", "-w", "d.txt"])),
+            None
+        );
+        // ... while a real flag after a consumed value still counts
+        assert_eq!(last_checkpoint(&os(&["-a", "--resume", "--no-checkpoint"])), Some(false));
+    }
+
+    #[test]
+    fn path_missing_matches_file_exists() {
+        let dir = std::env::temp_dir();
+        assert!(path_missing(&dir.join("dictcrack-no-such-path-test")), "missing path");
+        // C# File.Exists: a directory is not a file -> "不存在" branch
+        assert!(path_missing(&dir), "directory counts as missing");
+        let f = dir.join(format!("dictcrack-file-{}.tmp", std::process::id()));
+        std::fs::write(&f, b"x").unwrap();
+        assert!(!path_missing(&f), "regular file exists");
+        let _ = std::fs::remove_file(&f);
+    }
 }
