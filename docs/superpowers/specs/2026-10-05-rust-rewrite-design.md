@@ -24,10 +24,13 @@
 
 ## 2. 环境准备
 
-- 本机当前**无 Rust 工具链**（已确认 `cargo`/`rustc` 不在 PATH）。
-- 安装方式：`scoop install rust-msvc`（MSVC 工具链 + 静态 CRT，产物无
-  vcruntime 依赖，与现有单 exe 免安装形态一致）。
-- 构建：`cargo build --release`，MSRV 以 lockfile 记录的 stable 版本为准。
+- 工具链：`scoop install rust-gnu`（1.99.0，`x86_64-pc-windows-gnu`），已装好并验证可编译运行。
+- **链接器决策（2026-10-05 定）**：本机无 MSVC Build Tools（无 link.exe、无 vswhere），MSVC target 无法
+  链接；改用 GNU 工具链（rust-gnu 自带 MinGW 链接器）。为防其他已装 rust 包抢占 target，
+  在 `rust\.cargo\config.toml` 钉 `target = "x86_64-pc-windows-gnu"`，任何机器/CI 行为一致。
+- 产物形态：GNU target 静态链接 libgcc/libstdc++（Rust 运行时本身静态），单 exe 免安装，
+  与现有形态一致。
+- 构建：`cargo build --release`（在 `rust\` 下），MSRV 以 lockfile 记录的 stable 版本为准。
 - CI（`.github\workflows` 现有自动编译发布工作流）后续加 rust target；
   本期可先用本地构建验收，CI 接入列入里程碑 M4 可选项。
 
@@ -211,5 +214,5 @@ ZipCrypto 三条路径均不慢于 C# 版**；ZipCrypto 预期明显更快。PBK
 2. `tests\run-tests.ps1 -ExePath rust\target\release\dictcrack.exe` 18 项全绿。
 3. C#→Rust / Rust→C# 双向 `--resume` 续跑命中。
 4. 同机 bench：三条原生路径均不慢于 C# 版。
-5. Rust 产物为单 exe 静态链接，`rust\target\release\dictcrack.exe` 双击/命令行可用，
-   不依赖 vcruntime 等外部 DLL。
+5. Rust 产物为单 exe 静态链接（GNU target，libgcc/libstdc++ 静态），
+   `rust\target\release\dictcrack.exe` 双击/命令行可用，不依赖外部 DLL。
