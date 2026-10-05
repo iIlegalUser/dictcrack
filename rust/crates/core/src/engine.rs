@@ -237,15 +237,23 @@ impl CrackEngine {
 
         let info = archive::parse(&archive);
 
+        // pick the verifier: native first, else the 7z/rar spawn fallback
         let verifier_obj: Box<dyn Verifier + Send + Sync> = match verifier::create_native(&info, &archive) {
             Some(v) => v,
             None => {
-                // external-tool fallback is M4; report unsupported for now
-                res.error = Some(format!(
-                    "该压缩包不支持原生验证（{}）。外部工具回退尚未实现（M4）。",
-                    info.detect_note
-                ));
-                return res;
+                let tool = self
+                    .cfg
+                    .user_tool
+                    .clone()
+                    .filter(|t| !t.is_empty() && Path::new(t).exists())
+                    .or_else(crate::tool::ToolLocator::find_extractor);
+                match tool {
+                    Some(t) => Box::new(crate::tool::SpawnVerifier::new(t, archive.clone())),
+                    None => {
+                        res.error = Some("未找到可用的解压工具（7z.exe / rar.exe），无法测试该压缩包。".into());
+                        return res;
+                    }
+                }
             }
         };
 
@@ -257,6 +265,12 @@ impl CrackEngine {
         }
         if info.kind == ArchiveKind::Zip && info.zip.is_none() && info.detect_note.contains("no encrypted entry") {
             res.error = Some("该压缩包没有密码保护（或未检测到加密条目）。".into());
+            return res;
+        }
+        // non-native path: probe with an empty password - exit 0 means no
+        // password was needed, so there is nothing to crack
+        if !verifier_obj.native() && verifier_obj.verify("") {
+            res.error = Some("该压缩包没有密码保护，无需破解。".into());
             return res;
         }
 

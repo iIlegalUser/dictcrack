@@ -186,12 +186,8 @@ try {
     Expect-Hit 'test 5' $za $d 'aespw1'
 
     Write-Output 'test 6: 7z archive via external tool fallback'
-    if ($ExePath -ne '') {
-        Write-Output '  SKIP (external-tool fallback is M4 in the Rust build)'
-    } else {
     $d = Write-Dict 'd6.txt' @('apple', '7zpw2')
     Expect-Hit 'test 6' $s7 $d '7zpw2'
-    }
 
     Write-Output 'test 7: unencrypted archive errors out (exit 2)'
     Remove-Result $plain
@@ -347,9 +343,6 @@ try {
     # the password endbs\ into endbs" or endbs\\ and silently misses hits.
     # See Verifier.WinArg and the WinArg unit tests.
     Write-Output 'test 19: external-tool path with trailing-backslash password'
-    if ($ExePath -ne '') {
-        Write-Output '  SKIP (external-tool fallback is M4 in the Rust build)'
-    } else {
     $bsZip = New-7z 'bs.7z' 'endbs\'
     $d = Write-Dict 'd19.txt' @('wrong', 'endbs\')
     Remove-Result $bsZip
@@ -357,7 +350,6 @@ try {
     $got = Read-Result $bsZip
     if ($code -eq 0 -and $got -eq 'endbs\') { Pass 'test 19' }
     else { Fail 'test 19' ("exit=" + $code + " got='" + $got + "'") }
-    }
 
 } finally {
     # kill any surviving GUI processes started by the tests
