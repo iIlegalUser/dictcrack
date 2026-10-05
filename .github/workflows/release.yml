@@ -97,6 +97,9 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP 'stage-rust'
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item rust/target/x86_64-pc-windows-gnu/release/dictcrack.exe, README.md, passwords_sample.txt -Destination $stage
+          # dictcrack-rs.exe: drop this next to dictcrack-gui.exe (C# zip) and
+          # the GUI auto-detects it as the Rust engine (process mode, --progress)
+          Copy-Item rust/target/x86_64-pc-windows-gnu/release/dictcrack.exe (Join-Path $stage 'dictcrack-rs.exe')
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath "dist/DictCrack-rust-${{ github.ref_name }}.zip"
 
       - name: Upload Rust artifact

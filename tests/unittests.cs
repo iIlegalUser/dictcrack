@@ -63,6 +63,9 @@ namespace DictCrack
             TestResultEncoding();
             TestWinArgQuote();
             TestRar5Truncation();
+            TestMiniJson();
+            TestRemoteQuoteArg();
+            TestRemoteBuildArgs();
             Console.WriteLine(_fail == 0 ? "ALL PASS" : ("FAILURES: " + _fail));
             return _fail;
         }
@@ -576,6 +579,169 @@ namespace DictCrack
             Check("no crypt record, no throw", info != null && info.Rar5 == null);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    // ----------------------------------------------------------------
+    // --progress protocol parsing (RemoteEngine.MiniJson): the shape the
+    // Rust CLI emits must parse, hostile payloads must round-trip,
+    // structural surprises must yield null (the forward-compat rule)
+    private static void TestMiniJson()
+    {
+        Console.WriteLine("unit: MiniJson flat-object scanner");
+        // hand-written line pinning the exact wire shape
+        Dictionary<string, string> kv = MiniJson.Parse(
+            "{\"ev\":\"found\",\"password\":\"x\\\"y\\\\z\",\"tried\":123,\"elapsed\":4.6}");
+        Check("parses", kv != null);
+        Check("ev", kv != null && kv["ev"] == "found");
+        Check("quote+backslash round-trip", kv != null && kv["password"] == "x\"y\\z");
+        Check("number kept as text", kv != null && kv["tried"] == "123");
+        Check("float kept as text", kv != null && kv["elapsed"] == "4.6");
+
+        // hostile password (quote, backslash, LF, CJK, control char) built
+        // with a local emitter using the same escape rules as the Rust side
+        string hostile = "pw\"q\\\n中\u0007";
+        Dictionary<string, string> kv2 = MiniJson.Parse(
+            "{\"ev\":\"found\",\"password\":" + JsonQuote(hostile) + "}");
+        Check("hostile round-trip", kv2 != null && kv2["password"] == hostile);
+
+        Check("non-object rejected", MiniJson.Parse("hello") == null);
+        Check("unterminated string rejected", MiniJson.Parse("{\"a\":\"b}") == null);
+        Check("missing key quote rejected", MiniJson.Parse("{a\"\":1}") == null);
+        Check("empty object ok", MiniJson.Parse("{}") != null && MiniJson.Parse("{}").Count == 0);
+        Check("spaces tolerated", MiniJson.Parse("{ \"a\" : \"b\" , \"c\":5 }") != null);
+        Check("unknown value type token kept raw",
+            MiniJson.Parse("{\"n\":true}") != null && MiniJson.Parse("{\"n\":true}")["n"] == "true");
+    }
+
+    // same escaping rules as the Rust json_escape (protocol wire format)
+    private static string JsonQuote(string s)
+    {
+        StringBuilder sb = new StringBuilder();
+        sb.Append('"');
+        foreach (char c in s)
+        {
+            if (c == '"') sb.Append("\\\"");
+            else if (c == '\\') sb.Append("\\\\");
+            else if (c == '\n') sb.Append("\\n");
+            else if (c == '\r') sb.Append("\\r");
+            else if (c == '\t') sb.Append("\\t");
+            else if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+            else sb.Append(c);
+        }
+        sb.Append('"');
+        return sb.ToString();
+    }
+
+    // ----------------------------------------------------------------
+    private static void TestRemoteQuoteArg()
+    {
+        Console.WriteLine("unit: RemoteCrackEngine.QuoteArg (CRT argv rules)");
+        // anchors: hand-verified encodings
+        Check("plain stays bare", RemoteCrackEngine.QuoteArg("plain") == "plain");
+        Check("space quoted", RemoteCrackEngine.QuoteArg("with space") == "\"with space\"");
+        // no space/tab/quote: stays bare, and an unquoted trailing backslash
+        // is literal under CRT rules - no quoting needed
+        Check("trailing backslash stays bare", RemoteCrackEngine.QuoteArg("abc\\") == "abc\\");
+        Check("path backslashes stay bare", RemoteCrackEngine.QuoteArg("C:\\mydir\\a.rar") == "C:\\mydir\\a.rar");
+        // quoted form: trailing backslashes must double before the close quote
+        Check("quoted trailing backslash doubled", RemoteCrackEngine.QuoteArg("a b\\") == "\"a b\\\\\"");
+        Check("inner quote escaped", RemoteCrackEngine.QuoteArg("a\"b") == "\"a\\\"b\"");
+        Check("empty becomes quoted", RemoteCrackEngine.QuoteArg("") == "\"\"");
+        // property: every hostile value survives its own encoding when the
+        // consumer decodes with CRT/GetCommandLineW rules (what the Rust
+        // CLI's std::env::args does)
+        string[] hostile = new string[]
+        {
+            "pw\"q\\", "endbs\\", "a\\b\\c", "pw\\\"q", "C:\\my dir\\a.rar",
+            "with\ttab", "中密\\码", "\"lead", "trailing\\\\", "x\\", "a \"b\" c"
+        };
+        foreach (string s in hostile)
+            Check("round-trip: " + s, DecodeFirstArg(RemoteCrackEngine.QuoteArg(s)) == s);
+    }
+
+    // CRT argv decoder for ONE argument as emitted by QuoteArg (inverse
+    // of the encoding rules; see Raymond Chen "Everyone quotes command
+    // line arguments the wrong way")
+    private static string DecodeFirstArg(string s)
+    {
+        if (s.Length == 0 || s[0] != '"') return s;
+        StringBuilder sb = new StringBuilder();
+        int back = 0;
+        for (int i = 1; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (c == '\\') { back++; continue; }
+            if (c == '"')
+            {
+                if (back % 2 == 0)
+                {
+                    sb.Append('\\', back / 2);
+                    return sb.ToString();                   // 2n backslashes + quote: arg ends
+                }
+                sb.Append('\\', back / 2).Append('"');      // 2n+1: n backslashes + literal quote
+                back = 0;
+            }
+            else
+            {
+                sb.Append('\\', back);
+                back = 0;
+                sb.Append(c);
+            }
+        }
+        sb.Append('\\', back);
+        return sb.ToString();
+    }
+
+    // ----------------------------------------------------------------
+    private static void TestRemoteBuildArgs()
+    {
+        Console.WriteLine("unit: RemoteCrackEngine.BuildArgs (GUI -> Rust argv)");
+        CrackConfig cfg = new CrackConfig();
+        cfg.ArchivePath = "a.rar";
+        cfg.Mode = "dict";
+        cfg.DictFiles.Add("d1.txt");
+        cfg.Presets.Add("years");
+        cfg.Threads = 4;
+        string args = RemoteCrackEngine.BuildArgs(cfg);
+        Check("crack subcommand", args.StartsWith("crack ", StringComparison.Ordinal));
+        Check("archive", args.Contains(" -a a.rar "));
+        Check("dict", args.Contains(" -w d1.txt "));
+        Check("rule", args.Contains(" --rule years "));
+        Check("threads", args.Contains(" -t 4 "));
+        Check("progress flag", args.EndsWith(" --progress", StringComparison.Ordinal));
+        Check("session file pinned", args.Contains("--session-file ") && args.Contains("session.json"));
+        Check("result file pinned", args.Contains("--out ") && args.Contains("_password.txt"));
+
+        cfg.Mode = "mask";
+        cfg.Mask = "ab?d?d?d";
+        cfg.MaskMin = 1; cfg.MaskMax = 6;
+        cfg.CustomSets[0] = "x1"; cfg.CustomSets[1] = null;
+        args = RemoteCrackEngine.BuildArgs(cfg);
+        Check("mask", args.Contains("--mask ab?d?d?d"));
+        Check("custom set 1", args.Contains(" -1 x1 "));
+        Check("no custom set 2", !args.Contains(" -2 "));
+        Check("min/max", args.Contains("--min 1") && args.Contains("--max 6"));
+
+        cfg = new CrackConfig();
+        cfg.ArchivePath = "a.rar";
+        cfg.Mode = "comb";
+        cfg.DictFiles.Add("A.txt");
+        cfg.DictFileB = "B.txt";
+        cfg.CheckpointEnabled = false;
+        cfg.ResumeRequested = true;
+        args = RemoteCrackEngine.BuildArgs(cfg);
+        Check("comb w", args.Contains(" -w A.txt "));
+        Check("comb w2", args.Contains(" --w2 B.txt "));
+        Check("no-checkpoint", args.Contains("--no-checkpoint"));
+        Check("resume", args.Contains("--resume"));
+
+        // paths with spaces survive as one quoted argv element
+        cfg = new CrackConfig();
+        cfg.ArchivePath = @"C:\my dir\a.rar";
+        cfg.Mode = "dict";
+        cfg.DictFiles.Add(@"C:\my dir\d.txt");
+        args = RemoteCrackEngine.BuildArgs(cfg);
+        Check("space path one token", args.Contains(@" -a ""C:\my dir\a.rar"" "));
     }
 }
 }

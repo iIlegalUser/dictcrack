@@ -436,6 +436,57 @@ try {
     if ($cInfo -eq 2 -and $cBench -eq 2 -and $cCrack -eq 2) { Pass 'test 23' }
     else { Fail 'test 23' ("info=" + $cInfo + " bench=" + $cBench + " crack=" + $cCrack) }
 
+    # ---- test 24: --progress JSONL protocol (GUI process mode) --------
+    # on a hit stdout must be pure protocol: first line a JSON object, a
+    # "found" event carrying the password, no human banner mixed in
+    if ($ExePath -ne '') {
+        Write-Output 'test 24-26: --progress/--session-file (Rust-only options)'
+
+        Write-Output 'test 24: --progress emits JSON protocol lines on a hit'
+        $d = Write-Dict 'd24.txt' @('apple', 'zippw0')
+        Remove-Result $zc
+        $code = Run-Cli crack -a $zc -w $d --progress
+        $first = ($script:lastOut -split "`n")[0]
+        if ($code -eq 0 -and $first.StartsWith('{') -and $script:lastOut -match '\"ev\":\"found\"' -and $script:lastOut -match '\"password\":\"zippw0\"') { Pass 'test 24' }
+        else { Fail 'test 24' ("exit=" + $code + " first='" + $first + "'") }
+
+        Write-Output 'test 25: --progress done event on exhaustion (exit 1)'
+        $d = Write-Dict 'd25.txt' @('apple', 'banana')
+        Remove-Result $zc
+        $code = Run-Cli crack -a $zc -w $d --progress
+        if ($code -eq 1 -and $script:lastOut -match '\"ev\":\"done\"' -and $script:lastOut -match '\"status\":\"not_found\"') { Pass 'test 25' }
+        else { Fail 'test 25' ("exit=" + $code + " out='" + $script:lastOut + "'") }
+
+        # ---- test 26: --session-file pins the session (GUI sharing) ----
+        # the GUI passes its own session.json path; a maxed-out run must
+        # write THERE (and nowhere else), and --resume continues through it
+        Write-Output 'test 26: --session-file custom location + resume through it'
+        $sess2 = Join-Path $tmp 'custom-session.json'
+        Remove-Item -LiteralPath $sess2 -Force -ErrorAction SilentlyContinue
+        Remove-Item $session -Force -ErrorAction SilentlyContinue
+        $big26 = Join-Path $tmp 'big26.txt'
+        $lines26 = New-Object System.Collections.Generic.List[string]
+        for ($i = 1; $i -le 2000; $i++) { [void]$lines26.Add('filler' + $i.ToString('00000')) }
+        $lines26[1499] = 'sesspw1337'
+        [System.IO.File]::WriteAllLines($big26, $lines26)
+        $sessZip = New-Zip 'sess.zip' 'sesspw1337' 'ZipCrypto'
+        Remove-Result $sessZip
+        $code = Run-Cli crack -a $sessZip -w $big26 -t 1 --max-tries 5 --progress --session-file $sess2
+        if ($code -ne 3) { Fail 'test 26a' ("expected maxed-out exit 3, got " + $code) }
+        elseif (-not (Test-Path $sess2)) { Fail 'test 26a' 'no session at the custom --session-file path' }
+        elseif (Test-Path $session) { Fail 'test 26a' 'session leaked to the default exe-side path' }
+        else {
+            $code = Run-Cli crack -a $sessZip -w $big26 -t 1 --resume --progress --session-file $sess2
+            $got = Read-Result $sessZip
+            if ($code -eq 0 -and $got -eq 'sesspw1337') { Pass 'test 26' }
+            else { Fail 'test 26b' ("exit=" + $code + " got='" + $got + "'") }
+        }
+        Remove-Item -LiteralPath $sess2 -Force -ErrorAction SilentlyContinue
+        Remove-Result $sessZip
+    } else {
+        Write-Output 'test 24-26: SKIP (Rust-only options, C# CLI has no --progress)'
+    }
+
 } finally {
     if ($null -ne $oldTool) { $env:DICTCRACK_TOOL = $oldTool }
     else { Remove-Item Env:\DICTCRACK_TOOL -ErrorAction SilentlyContinue }

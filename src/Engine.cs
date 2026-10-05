@@ -77,6 +77,9 @@ namespace DictCrack
 
         public long Tried { get { return Interlocked.Read(ref _tried); } }
         public void AddTried() { Interlocked.Increment(ref _tried); }
+        // absolute write for the process-mode engine: the Rust --progress
+        // protocol reports the cumulative tried count per stats event
+        public void SetTried(long v) { Interlocked.Exchange(ref _tried, v); }
         public bool Reached(long n) { return Interlocked.Read(ref _tried) >= n; }
         public long BaseTried { get { return Interlocked.Read(ref _baseTried); } set { Interlocked.Exchange(ref _baseTried, value); } }
         public long Total { get { return Interlocked.Read(ref _total); } set { Interlocked.Exchange(ref _total, value); } }

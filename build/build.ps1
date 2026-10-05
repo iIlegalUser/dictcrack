@@ -34,7 +34,7 @@ Write-Output 'OK dist\dictcrack.exe'
 $guiArgs = @('/nologo', '/target:winexe', '/optimize+', '/warnaserror-', '/utf8output',
     ('/out:' + $outGui),
     '/r:System.dll', '/r:System.Core.dll',
-    '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll') + $shared + @((Join-Path $src 'Gui.cs'))
+    '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll') + $shared + @((Join-Path $src 'RemoteEngine.cs'), (Join-Path $src 'Gui.cs'))
 
 & $csc @guiArgs
 if ($LASTEXITCODE -ne 0) { throw "GUI compile failed ($LASTEXITCODE)" }

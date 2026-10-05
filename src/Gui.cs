@@ -77,6 +77,7 @@ namespace DictCrack
         private Panel pnlComb;
         private Label lblMaskSpace;
         private Label lblFormat;
+        private Label lblSub;
         private CheckBox chkResume;
         private Panel pbTrack;
         private Panel pbFill;
@@ -95,7 +96,10 @@ namespace DictCrack
 
         private readonly string _cfgFile;
         private Thread _workThread;
-        private CrackEngine _engine;
+        private CrackEngine _engine;                // built-in C# engine (in-process)
+        private RemoteCrackEngine _remote;          // Rust engine (process mode, --progress)
+        private string _remoteExe;                  // probed Rust dictcrack.exe; null = fallback
+        private ManualResetEvent _probeDone;
         private CrackResult _result;
         private System.Windows.Forms.Timer _timer;
         private readonly Stopwatch _watch = new Stopwatch();
@@ -176,7 +180,7 @@ namespace DictCrack
             lblTitle.Location = new Point(S(22), S(11));
             lblTitle.Size = new Size(S(320), S(30));
             lblTitle.BackColor = Color.Transparent;
-            Label lblSub = new Label();
+            lblSub = new Label();
             lblSub.Text = "RAR5 / ZIP 原生加速 · RAR / 7Z 全格式 · 字典 / 掩码 / 组合";
             lblSub.ForeColor = cHeader2;
             lblSub.Font = new Font("Microsoft YaHei UI", 8.5f);
@@ -524,6 +528,30 @@ namespace DictCrack
 
             LoadSettings();
             HandleAutoStart();
+            StartEngineProbe();
+        }
+
+        // probe for the Rust engine once, off the UI thread: found => crack
+        // and bench run in process mode, else the built-in C# engine is used
+        private void StartEngineProbe()
+        {
+            _probeDone = new ManualResetEvent(false);
+            ManualResetEvent done = _probeDone;
+            ThreadPool.QueueUserWorkItem(delegate(object state)
+            {
+                string exe = RustLocator.Find();
+                _remoteExe = exe;
+                done.Set();
+                if (exe != null)
+                {
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate()
+                        { lblSub.Text += "  · 引擎: Rust 进程模式"; });
+                    }
+                    catch { }
+                }
+            });
         }
 
         // ----------------------------------------------------------------
@@ -742,6 +770,9 @@ namespace DictCrack
             }
             cfg.ResumeRequested = resume;
             SaveSettings(cfg);
+            // the probe usually finished while the user filled the form; wait
+            // a moment so the first start already picks the faster engine
+            try { _probeDone.WaitOne(2000); } catch { }
             StartEngine(cfg);
         }
 
@@ -772,14 +803,27 @@ namespace DictCrack
             _rateTick.Restart();
             _rate = 0;
 
-            _engine = new CrackEngine(cfg);
+            if (_remoteExe != null)
+            {
+                _engine = null;
+                _remote = new RemoteCrackEngine(cfg, _remoteExe);
+                SetStatus("正在启动（" + shown + " 线程 · Rust 引擎）...", cText);
+            }
+            else
+            {
+                _remote = null;
+                _engine = new CrackEngine(cfg);
+                SetStatus("正在启动（" + shown + " 线程）...", cText);
+            }
+
             _cts = new CancellationTokenSource();
             CancellationTokenSource cts = _cts;
             CrackEngine engine = _engine;
+            RemoteCrackEngine remote = _remote;
             _workThread = new Thread(delegate()
             {
                 CrackResult r = null;
-                try { r = engine.Run(cts.Token); }
+                try { r = remote != null ? remote.Run(cts.Token) : engine.Run(cts.Token); }
                 catch (Exception ex) { r = new CrackResult(); r.Error = ex.Message; }
                 _result = r;
             }) { IsBackground = true };
@@ -808,6 +852,24 @@ namespace DictCrack
             string arch = Path.GetFullPath(txtArch.Text.Trim());
             ThreadPool.QueueUserWorkItem(delegate(object state)
             {
+                if (_remoteExe != null)
+                {
+                    // process mode: measure the engine that will actually crack
+                    string text = null, berr = null;
+                    try { text = RustBench.Run(_remoteExe, arch, threads); }
+                    catch (Exception ex) { berr = ex.Message; }
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate()
+                        {
+                            btnBench.Enabled = true;
+                            if (berr != null) SetStatus("测速失败: " + berr, cRed);
+                            else if (!_running) SetStatus(text, cPrimary);
+                        });
+                    }
+                    catch { }
+                    return;
+                }
                 double single = 0, all = 0; string err = null;
                 try
                 {
@@ -978,7 +1040,7 @@ namespace DictCrack
             if (!_running) return;
             try
             {
-                EngineStats st = _engine.Stats;
+                EngineStats st = _remote != null ? _remote.Stats : _engine.Stats;
                 long triedAllNow = st.Tried + st.BaseTried;
 
                 if (_rateTick.Elapsed.TotalSeconds >= 0.5)
@@ -1073,7 +1135,8 @@ namespace DictCrack
             }
             else
             {
-                SetStatus("未找到密码。" + (_engine.LogNote.Length > 0 ? "（编码方案: " + _engine.LogNote + "）" : ""), cOrange);
+                string note = _remote != null ? _remote.LogNote : _engine.LogNote;
+                SetStatus("未找到密码。" + (note.Length > 0 ? "（编码方案: " + note + "）" : ""), cOrange);
             }
         }
 

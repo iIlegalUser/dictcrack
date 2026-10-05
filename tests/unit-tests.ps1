@@ -21,6 +21,7 @@ $out = Join-Path $dist 'dictcrack-unittest.exe'
     (Join-Path $src 'Verifier.cs'),
     (Join-Path $src 'Attacks.cs'),
     (Join-Path $src 'Engine.cs'),
+    (Join-Path $src 'RemoteEngine.cs'),
     (Join-Path $PSScriptRoot 'unittests.cs')
 if ($LASTEXITCODE -ne 0) { throw "unit test compile failed ($LASTEXITCODE)" }
 

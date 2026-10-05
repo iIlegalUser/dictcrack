@@ -32,6 +32,10 @@ pub struct CrackConfig {
     pub quiet: bool,
     pub out_file: Option<String>,
     pub dedupe: bool,
+    /// GUI process mode: where session.json lives. None = next to the exe
+    /// (the CLI default). The GUI pins this to its own folder so sessions
+    /// stay interoperable with the built-in C# engine's resume dialog.
+    pub session_file: Option<String>,
 }
 
 impl CrackConfig {
@@ -306,7 +310,10 @@ impl CrackEngine {
         };
 
         let mut pos = SourcePosition::default();
-        let sess_path = session::session_path();
+        let sess_path: PathBuf = match &self.cfg.session_file {
+            Some(p) => PathBuf::from(p),
+            None => session::session_path(),
+        };
         let mut sess: Option<SessionState> = None;
         let mut session_save_failed = false;
         if self.cfg.checkpoint_enabled {
@@ -368,6 +375,26 @@ impl CrackEngine {
         let cancel = Arc::new(AtomicBool::new(false));
         let hit_password = Arc::new(Mutex::new(Option::<String>::None));
         let producer_error = Arc::new(Mutex::new(Option::<String>::None));
+
+        // bridge external -> internal cancel, the Rust counterpart of the
+        // C# linked CancellationTokenSource: the candidate sources' loops
+        // only watch the internal flag, and with mutation presets a single
+        // line can fan out up to 100k candidates, so an external stop
+        // (Ctrl+C / GUI cancel event) that only reached the emit closure
+        // would leave the producer discarding candidates for hours
+        {
+            let external_bridge = external.clone();
+            let cancel_bridge = cancel.clone();
+            std::thread::spawn(move || {
+                while !cancel_bridge.load(Ordering::Relaxed) {
+                    if external_bridge.load(Ordering::Relaxed) {
+                        cancel_bridge.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+        }
 
         // live position shared producer -> checkpoint thread
         let live_pos = Arc::new(Mutex::new(pos.clone()));
