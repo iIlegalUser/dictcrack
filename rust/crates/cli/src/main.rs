@@ -1,7 +1,9 @@
 // dictcrack CLI (Rust rewrite of Cli.cs).
 use clap::{Parser, Subcommand};
 use dictcrack_core::archive::{self, ArchiveKind};
+use dictcrack_core::{engine, verifier};
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "dictcrack", version, about = "DictCrack - 压缩包密码字典/掩码破解工具（原生引擎）", long_about = None)]
@@ -116,14 +118,40 @@ fn cmd_info(archive_path: &str, hashcat: bool) -> i32 {
     0
 }
 
+fn cmd_bench(archive_path: &str, threads: u32, seconds: u32) -> i32 {
+    if !Path::new(archive_path).exists() {
+        eprintln!("文件不存在: {}", archive_path);
+        return 2;
+    }
+    let info = archive::parse(archive_path);
+    if !info.native_supported() {
+        eprintln!("该压缩包不支持原生验证（{}），基准测速需要 RAR5 或加密 ZIP。", info.detect_note);
+        return 2;
+    }
+    let v: Arc<dyn verifier::Verifier + Send + Sync> = match verifier::create_native(&info, archive_path) {
+        Some(v) => v.into(),
+        None => {
+            eprintln!("无法创建原生验证器。");
+            return 2;
+        }
+    };
+    println!("{}", v.describe());
+    let single = engine::bench_measure(&v, 1, seconds);
+    println!("单线程: {:.1} 个/秒", single);
+    let all = engine::bench_measure(&v, threads, seconds);
+    println!(
+        "{}: {:.1} 个/秒",
+        if threads > 0 { format!("{} 线程", threads) } else { "自动线程".to_string() },
+        all
+    );
+    0
+}
+
 fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Some(Commands::Info { archive, hashcat }) => cmd_info(&archive, hashcat),
-        Some(Commands::Bench { archive, threads, seconds }) => {
-            println!("bench: {} t={} s={} (TODO M2)", archive, threads, seconds);
-            0
-        }
+        Some(Commands::Bench { archive, threads, seconds }) => cmd_bench(&archive, threads, seconds),
         Some(Commands::Crack { archive }) => {
             println!("crack: {} (TODO M3)", archive);
             0
