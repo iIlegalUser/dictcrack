@@ -160,6 +160,7 @@ name = "dictcrack-core"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "cpufeatures",
  "crossbeam-channel",
  "ctr",
  "encoding_rs",

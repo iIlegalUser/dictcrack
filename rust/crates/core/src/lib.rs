@@ -6,6 +6,7 @@ pub mod attacks;
 pub mod crypto;
 pub mod encoding;
 pub mod engine;
+pub mod rar3;
 pub mod result;
 pub mod session;
 pub mod tool;

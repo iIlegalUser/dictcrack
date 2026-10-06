@@ -118,8 +118,20 @@ namespace DictCrack
         /// exhaustion. Saves checkpoints every 3 s; on a hit writes the
         /// result file (WriteResultText) and deletes the session. Never
         /// throws for per-candidate errors - failures land in res.Error.
+        ///
+        /// Stats.Done is published here, on the single exit funnel, because
+        /// RunCore has several early returns (missing file, parse failure,
+        /// no tool, no password protection, ...). The CLI's progress printer
+        /// loops on Stats.Done and the caller joins that thread
+        /// unconditionally, so a missed store hangs the process forever.
         /// </summary>
         public CrackResult Run(CancellationToken external)
+        {
+            try { return RunCore(external); }
+            finally { Stats.Done = true; }
+        }
+
+        private CrackResult RunCore(CancellationToken external)
         {
             CrackResult res = new CrackResult();
             Stopwatch sw = Stopwatch.StartNew();

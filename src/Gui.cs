@@ -616,6 +616,11 @@ namespace DictCrack
                 string note = null;
                 try
                 {
+                    // the engine probe decides whether the RAR4/7z label says
+                    // "native" or "external tool"; it runs at startup and this
+                    // callback is already off the UI thread, so a short wait
+                    // here is safe and avoids a wrong first-paint label
+                    try { if (_probeDone != null) _probeDone.WaitOne(2000); } catch { }
                     ArchiveInfo info = ArchiveParser.Parse(path);
                     if (info.Kind == ArchiveKind.Rar5 && info.NativeSupported)
                         note = info.Rar5.HeaderEncrypted
@@ -625,8 +630,13 @@ namespace DictCrack
                         note = (info.Zip.Aes ? "ZIP AES-" + (info.Zip.AesStrength * 64 + 64) : "ZIP ZipCrypto")
                             + " 原生加速 · 加密条目: " + info.Zip.Name;
                     else if (info.Kind == ArchiveKind.Zip && info.Zip == null) note = "ZIP（未检测到加密条目）";
-                    else if (info.Kind == ArchiveKind.RarLegacy) note = "RAR 1.5-4.x（外部工具）";
-                    else if (info.Kind == ArchiveKind.SevenZip) note = "7z（外部工具）";
+                    // RAR4 / 7z are native only in the Rust engine (this C# parser
+                    // cannot see those headers), so the label depends on which
+                    // engine will actually run; _remoteExe is null in fallback mode
+                    else if (info.Kind == ArchiveKind.RarLegacy)
+                        note = _remoteExe != null ? "RAR 1.5-4.x（Rust 原生加速）" : "RAR 1.5-4.x（外部工具）";
+                    else if (info.Kind == ArchiveKind.SevenZip)
+                        note = _remoteExe != null ? "7z（Rust 原生加速，视 coder 链而定）" : "7z（外部工具）";
                     else note = "未知格式（尝试外部工具）";
                 }
                 catch { note = ""; }
@@ -874,7 +884,9 @@ namespace DictCrack
                 try
                 {
                     ArchiveInfo info = ArchiveParser.Parse(arch);
-                    if (!info.NativeSupported) err = "该格式不支持原生测速（需要 RAR5 或加密 ZIP）";
+                    if (!info.NativeSupported)
+                        err = "该格式不支持内置引擎原生测速（需要 RAR5 或加密 ZIP）；"
+                            + "RAR 1.5-4.x 与 7z 的原生测速需要 Rust 引擎";
                     else
                     {
                         Verifier v = VerifierFactory.Create(info, null, arch);

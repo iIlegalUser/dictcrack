@@ -86,12 +86,31 @@ function Run-Cli {
     # returns exit code; stdout/stderr available via $script:lastOut.
     # EAP must be Continue here: with Stop, redirecting the child's
     # stderr (2>&1) raises NativeCommandError on error-path tests.
+    #
+    # Runs under a watchdog on purpose: a CLI that never returns (the
+    # pre-flight done-flag hang once wedged the whole suite with no output)
+    # must fail the test, not block CI forever. 120s is far above the
+    # slowest legitimate case here (test 15/26 resume runs are seconds).
     $old = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $out = & $script:cli @args 2>&1
+    $job = Start-Job -ScriptBlock {
+        param($exe, $cliArgs)
+        $ErrorActionPreference = 'Continue'
+        $o = & $exe @cliArgs 2>&1
+        [pscustomobject]@{ Out = (($o | ForEach-Object { "$_" }) -join "`n"); Code = $LASTEXITCODE }
+    } -ArgumentList $script:cli, $args
+    if (-not (Wait-Job $job -Timeout 120)) {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        $ErrorActionPreference = $old
+        $script:lastOut = 'TIMEOUT: CLI did not exit within 120s'
+        return -999
+    }
+    $r = Receive-Job $job
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
     $ErrorActionPreference = $old
-    $script:lastOut = ($out | ForEach-Object { "$_" }) -join "`n"
-    return $LASTEXITCODE
+    $script:lastOut = $r.Out
+    return $r.Code
 }
 
 try {
@@ -127,8 +146,71 @@ try {
         if (-not (Test-Path $a)) { throw "failed to create $a" }
         return $a
     }
-    function New-7zRaw([string]$name, [string]$pw) {
-        # a password containing quotes cannot go through PowerShell's native
+    # RAR 1.5-4.x fixtures. WinRAR 7.12 cannot create RAR4 ("-ma4" is
+    # rejected: unknown option), so the two gold archives are frozen here as
+    # hex literals. Both were verified against external reference
+    # decryptors before being frozen:
+    #   rar4hp.rar  -hp, pw HpGold55   -> UnRAR.exe t exit 0 (wrong pw 3)
+    #   rar4p.rar   -p stored, pw Rar4Gold9 -> 7z.exe t exit 0 (wrong pw 2)
+    function New-Rar4([string]$name, [string]$hex) {
+        $a = Join-Path $script:tmp $name
+        $bytes = New-Object byte[] ($hex.Length / 2)
+        for ($i = 0; $i -lt $bytes.Length; $i++) {
+            $bytes[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16)
+        }
+        [System.IO.File]::WriteAllBytes($a, $bytes)
+        return $a
+    }
+    # 7z fixtures used by the native-7z tests. The coder layout of an archive
+    # decides whether a password can be checked natively, so these cover one
+    # archive per branch:
+    #   s7z_mhe   header-encrypted (-mhe), AES-only header folder -> native CRC
+    #   s7z_copy  content-encrypted, stored entry (AES + COPY)   -> native CRC
+    #   s7z_lzma2 content-encrypted, LZMA2 entry                 -> external tool
+    # (a "-mhe" archive whose header needs a decompressor also falls back;
+    #  that branch is covered by the Rust unit tests' frozen samples)
+    function New-7zMhe([string]$name, [string]$pw) {
+        $a = Join-Path $script:tmp $name
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $script:sz
+        $psi.Arguments = 'a -y -mhe=on "-p' + $pw + '" "' + $a + '" "' + (Join-Path $script:tmp 'payload.txt') + '"'
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $p.WaitForExit()
+        if ($p.ExitCode -ne 0) { throw ("7z exited " + $p.ExitCode + " while creating " + $a) }
+        if (-not (Test-Path $a)) { throw "failed to create $a" }
+        return $a
+    }
+    function New-7zCopy([string]$name, [string]$pw) {
+        # -m0=Copy keeps the entry stored, so the only coder above AES is COPY
+        $a = Join-Path $script:tmp $name
+        & $script:sz a -y -m0=Copy "-p$pw" $a (Join-Path $script:tmp 'payload.txt') | Out-Null
+        if (-not (Test-Path $a)) { throw "failed to create $a" }
+        return $a
+    }
+    function New-7zCopyTiny([string]$name, [string]$pw, [int]$bytes) {
+        # a payload small enough to fit ONE AES block (pack == 16) with
+        # padding. Regression guard: the AES+COPY padding pre-filter used to
+        # look at the previous ciphertext block for the CBC IV, so a
+        # single-block stream had no IV to chain from and every candidate was
+        # rejected -- a silent false negative on a real password.
+        $a = Join-Path $script:tmp $name
+        $src = Join-Path $script:tmp ("tiny" + $bytes + ".bin")
+        $buf = New-Object byte[] $bytes
+        for ($i = 0; $i -lt $bytes; $i++) { $buf[$i] = 0x41 + ($i % 26) }
+        [System.IO.File]::WriteAllBytes($src, $buf)
+        & $script:sz a -y -m0=Copy "-p$pw" $a $src | Out-Null
+        if (-not (Test-Path $a)) { throw "failed to create $a" }
+        return $a
+    }
+    function New-7zLzma2([string]$name, [string]$pw) {
+        $a = Join-Path $script:tmp $name
+        & $script:sz a -y -m0=LZMA2 "-p$pw" $a (Join-Path $script:tmp 'payload.txt') | Out-Null
+        if (-not (Test-Path $a)) { throw "failed to create $a" }
+        return $a
+    }
+    function New-7zRaw([string]$name, [string]$pw) {        # a password containing quotes cannot go through PowerShell's native
         # argument encoding (PS rewrites " to \"), but 7z.exe parses the raw
         # command line itself ("" collapses to one quote), so build that line
         # directly - same rules WinArg.SimpleQuote applies on the crack side
@@ -153,6 +235,18 @@ try {
     $zc = New-Zip 'zc.zip' 'zippw0' 'ZipCrypto'
     $za = New-Zip 'za.zip' 'aespw1' 'AES256'
     $s7 = New-7z 's7.7z' '7zpw2'
+    # native-7z fixtures, one per coder-layout branch (see New-7zMhe etc.)
+    $s7mhe = New-7zMhe 's7mhe.7z' 'mhepw77'
+    $s7copy = New-7zCopy 's7copy.7z' 'copypw88'
+    $s7lzma2 = New-7zLzma2 's7lzma2.7z' 'lzmapw99'
+    # RAR4 gold samples (see New-Rar4): hp = header-encrypted, p = stored -p
+    $rar4hp = New-Rar4 'rar4hp.rar' ('526172211a0700ce997380000d000000000000002b91d04c6e88f71551ec4427d1525719' +
+        '3c8498c3f5d9a217d44725a3c16fe7b6b845e34bef23412d6fce3bbc05248fad73506e52' +
+        'badf2f2769f960be8d8c16903627623886af1a90c348e1358c92c40c88f5282b428f492c' +
+        '77e2b0a41d9c5f38626d22a5386ea6908ae7e906a91e543a')
+    $rar4p = New-Rar4 'rar4p.rar' ('526172211a0700cf907300000d000000000000005ae17404843000200000001d00000003' +
+        '17dabb7e000000501d30080020000000676f6c642e74787411c3a54f8e2b90d1211b0f19' +
+        '0c49038d823063bf4407acdd11a4a4548ae77eb1e43543531f4e3861c43d7b00400700')
     $plain = Join-Path $tmp 'plain.zip'
     & $sz a $plain (Join-Path $tmp 'payload.txt') | Out-Null
 
@@ -204,6 +298,43 @@ try {
         Write-Output 'test 1-3: SKIP (no rar.exe)'
     }
 
+    # ---- test 3a-3d: RAR4 native path (frozen gold samples) ----------
+    # These do NOT need rar.exe: the archives are byte literals already
+    # validated against UnRAR/7z.exe, and RAR4 was previously spawn-only.
+    #
+    # Only the Rust engine has native RAR4; the C# engine deliberately keeps
+    # the 7z.exe fallback. So the *routing* assertion is engine-aware while
+    # the hit/miss assertions run on both (the fallback reaches the same
+    # answers, just through a subprocess).
+    $rustEngine = $ExePath -ne ''
+    Write-Output 'test 3a: info routes RAR4 -hp to the engine that supports it'
+    $code = Run-Cli info $rar4hp
+    $wantRoute = if ($rustEngine) { 'native' } else { 'external' }
+    if ($code -eq 0 -and $script:lastOut -match 'RAR 1.5-4.x' -and $script:lastOut -match $wantRoute) { Pass 'test 3a' }
+    else { Fail 'test 3a' ("want=" + $wantRoute + " " + ($script:lastOut -replace "`n", ' | ')) }
+
+    Write-Output 'test 3b: RAR4 -hp dictionary hit (SHA-1 KDF + ENDARC block)'
+    $d = Write-Dict 'd3b.txt' @('apple', 'HpGold55', 'banana')
+    Expect-Hit 'test 3b' $rar4hp $d 'HpGold55'
+
+    Write-Output 'test 3c: RAR4 -p stored dictionary hit (KDF + AES-CBC + CRC32)'
+    $code = Run-Cli info $rar4p
+    # the target entry name only appears once the Rust parser reads the RAR4
+    # file header; the C# engine has no RAR4 header support
+    $nameOk = (-not $rustEngine) -or ($script:lastOut -match 'gold.txt')
+    if ($code -ne 0 -or -not $nameOk) { Fail 'test 3c' ('info: ' + ($script:lastOut -replace "`n", ' | ')) }
+    else {
+        $d = Write-Dict 'd3c.txt' @('apple', 'banana', 'Rar4Gold9')
+        Expect-Hit 'test 3c' $rar4p $d 'Rar4Gold9'
+    }
+
+    Write-Output 'test 3d: RAR4 wrong dictionary exhausts (exit 1, no result)'
+    $d = Write-Dict 'd3d.txt' @('apple', 'Rar4Gold', 'HpGold5', 'banana')
+    Remove-Result $rar4hp
+    $code = Run-Cli crack -a $rar4hp -w $d -q
+    if ($code -eq 1 -and -not (Test-Path (Result-Path $rar4hp))) { Pass 'test 3d' }
+    else { Fail 'test 3d' ("exit=" + $code) }
+
     Write-Output 'test 4: ZIP ZipCrypto hit incl. full-CRC confirm'
     $d = Write-Dict 'd4.txt' @('apple', 'zippw0')
     Expect-Hit 'test 4' $zc $d 'zippw0'
@@ -215,6 +346,99 @@ try {
     Write-Output 'test 6: 7z archive via external tool fallback'
     $d = Write-Dict 'd6.txt' @('apple', '7zpw2')
     Expect-Hit 'test 6' $s7 $d '7zpw2'
+
+    # ---- test 6a-6d: native 7z paths ---------------------------------
+    # Which 7z archives can be checked natively depends on the coder chain,
+    # not on the file extension: an AES-only header (or AES + COPY) has a
+    # CRC to compare, while AES + LZMA/LZMA2 needs a decompressor and must
+    # stay on the external tool.
+    #
+    # Native 7z exists only in the Rust engine, so 6a (routing) and 6d (the
+    # no-external-tool proof) require -ExePath. The hit/miss assertions 6b/6c
+    # run on both engines, since the C# fallback reaches the same answers
+    # through 7z.exe.
+    if ($rustEngine) {
+        Write-Output 'test 6a: info routes 7z branches (native vs external)'
+        $iMhe = (Run-Cli info $s7mhe) | Out-Null; $oMhe = $script:lastOut
+        $iCopy = (Run-Cli info $s7copy) | Out-Null; $oCopy = $script:lastOut
+        $iLz = (Run-Cli info $s7lzma2) | Out-Null; $oLz = $script:lastOut
+        $mheNative = ($oMhe -match 'native') -and ($oMhe -notmatch 'external')
+        $copyNative = ($oCopy -match 'native') -and ($oCopy -notmatch 'external')
+        $lzExternal = $oLz -match 'external'
+        if ($mheNative -and $copyNative -and $lzExternal) { Pass 'test 6a' }
+        else {
+            Fail 'test 6a' ("mhe=[" + ($oMhe -replace "`n", ' ') + "] copy=[" + ($oCopy -replace "`n", ' ') +
+                "] lzma2=[" + ($oLz -replace "`n", ' ') + "]")
+        }
+    } else {
+        Write-Output 'test 6a: SKIP (routing assertions need the Rust engine)'
+    }
+
+    Write-Output 'test 6b: 7z -mhe dictionary hit (AES-only header CRC)'
+    $d = Write-Dict 'd6b.txt' @('apple', 'mhepw77', 'banana')
+    Expect-Hit 'test 6b' $s7mhe $d 'mhepw77'
+
+    Write-Output 'test 6c: 7z AES+COPY content hit (CRC over plaintext)'
+    $d = Write-Dict 'd6c.txt' @('apple', 'copypw88')
+    Expect-Hit 'test 6c' $s7copy $d 'copypw88'
+
+    # The decisive check that 6b/6c are really native: with the fallback tool
+    # pointing at a nonexistent path, a spawn-based verifier cannot work at
+    # all, so a hit here can only come from the native 7z path. (On the C#
+    # engine there is no native path, so this would fail by design.)
+    if ($rustEngine) {
+        Write-Output 'test 6d: no false positive without any external tool'
+        $savedTool = $env:DICTCRACK_TOOL
+        $env:DICTCRACK_TOOL = Join-Path $tmp 'no-such-tool.exe'
+        try {
+            Remove-Result $s7mhe
+            $cGood = Run-Cli crack -a $s7mhe -w (Write-Dict 'd6d1.txt' @('apple', 'mhepw77')) -t 2 -q
+            $gotGood = Read-Result $s7mhe
+            Remove-Result $s7mhe
+            $cBad = Run-Cli crack -a $s7mhe -w (Write-Dict 'd6d2.txt' @('apple', 'banana')) -t 2 -q
+            $leaked = Test-Path (Result-Path $s7mhe)
+            if ($cGood -eq 0 -and $gotGood -eq 'mhepw77' -and $cBad -eq 1 -and -not $leaked) { Pass 'test 6d' }
+            else {
+                Fail 'test 6d' ("good exit=" + $cGood + " got='" + $gotGood + "' bad exit=" + $cBad + " leaked=" + $leaked)
+            }
+        } finally {
+            if ($null -ne $savedTool) { $env:DICTCRACK_TOOL = $savedTool } else { Remove-Item Env:\DICTCRACK_TOOL -ErrorAction SilentlyContinue }
+        }
+    } else {
+        Write-Output 'test 6d: SKIP (needs the Rust engine native 7z path)'
+    }
+
+    # ---- test 6e: 7z needing a decompressor keeps working via the tool --
+    Write-Output 'test 6e: AES+LZMA2 7z falls back to the external tool and still hits'
+    $d = Write-Dict 'd6e.txt' @('apple', 'lzmapw99')
+    Expect-Hit 'test 6e' $s7lzma2 $d 'lzmapw99'
+
+    # ---- test 6f: single-cipher-block AES+COPY (false-negative guard) ---
+    # A payload under 16 bytes yields a one-block AES-CBC stream, where the
+    # padding filter has no preceding ciphertext block to use as the IV. It
+    # must fall back to the coder's own IV, not reject every candidate: a
+    # false negative here reports "not found" for a password that is correct.
+    Write-Output 'test 6f: single-block AES+COPY still finds the right password'
+    $s7tiny = New-7zCopyTiny 's7tiny.7z' 'tinypw11' 14
+    $s7one = New-7zCopyTiny 's7one.7z' 'tinypw11' 1
+    $d = Write-Dict 'd6f.txt' @('apple', 'tinypw11')
+    $okT = $false; $okO = $false
+    Remove-Result $s7tiny
+    $cT = Run-Cli crack -a $s7tiny -w $d -t 2 -q
+    if ($cT -eq 0 -and (Read-Result $s7tiny) -eq 'tinypw11') { $okT = $true }
+    Remove-Result $s7one
+    $cO = Run-Cli crack -a $s7one -w $d -t 2 -q
+    if ($cO -eq 0 -and (Read-Result $s7one) -eq 'tinypw11') { $okO = $true }
+    # and the wrong password must still be rejected on both
+    $dB = Write-Dict 'd6f2.txt' @('apple', 'banana')
+    Remove-Result $s7tiny
+    $cB = Run-Cli crack -a $s7tiny -w $dB -t 2 -q
+    $leak = Test-Path (Result-Path $s7tiny)
+    if ($okT -and $okO -and $cB -eq 1 -and -not $leak) { Pass 'test 6f' }
+    else {
+        Fail 'test 6f' ("14B exit=" + $cT + " ok=" + $okT + " 1B exit=" + $cO + " ok=" + $okO +
+            " wrong exit=" + $cB + " leaked=" + $leak)
+    }
 
     Write-Output 'test 7: unencrypted archive errors out (exit 2)'
     Remove-Result $plain
@@ -300,6 +524,29 @@ try {
     } else {
         Write-Output 'test 15: SKIP (no rar.exe)'
     }
+
+    # ---- test 15b: RAR4 checkpoint + resume ----------------------------
+    # The RAR4 KDF is ~10 ms/candidate, so a resume test is cheap here.
+    # Verifies the session path works on the native RAR4 verifier too: a
+    # maxed-out run records the position and --resume continues past it.
+    Write-Output 'test 15b: RAR4 checkpoint + resume (--max-tries then --resume)'
+    $big4 = Join-Path $tmp 'big4.txt'
+    $lines4 = New-Object System.Collections.Generic.List[string]
+    for ($i = 1; $i -le 40; $i++) { [void]$lines4.Add('filler' + $i.ToString('0000')) }
+    $lines4[29] = 'Rar4Gold9'
+    [System.IO.File]::WriteAllLines($big4, $lines4)
+    Remove-Result $rar4p
+    $code = Run-Cli crack -a $rar4p -w $big4 -t 2 --max-tries 10 -q
+    if ($code -ne 3) { Fail 'test 15b-a' ("expected stop exit 3, got " + $code) }
+    elseif (-not (Test-Path $session)) { Fail 'test 15b-a' 'no session file after maxed-out run' }
+    else {
+        $code = Run-Cli crack -a $rar4p -w $big4 -t 2 --resume -q
+        $got = Read-Result $rar4p
+        if ($code -eq 0 -and $got -eq 'Rar4Gold9') { Pass 'test 15b' }
+        else { Fail 'test 15b-b' ("exit=" + $code + " got='" + $got + "'") }
+    }
+    Remove-Item $session -Force -ErrorAction SilentlyContinue
+    Remove-Result $rar4p
 
     # ---- test 16: benchmark smoke --------------------------------------
     Write-Output 'test 16: benchmark smoke (native zip)'
@@ -417,6 +664,29 @@ try {
     $cBench = Run-Cli bench -a $noDir
     if ($cInfo -eq 2 -and $cCrack -eq 2 -and $cBench -eq 2) { Pass 'test 22' }
     else { Fail 'test 22' ("info=" + $cInfo + " crack=" + $cCrack + " bench=" + $cBench) }
+
+    # ---- test 22b: pre-flight rejections must not hang ----------------
+    # Regression for a real hang: engine.run's early returns did not publish
+    # the done flag, and main.rs prints with `while !done` then joins that
+    # thread unconditionally -- so every pre-flight rejection looped forever
+    # spamming the "preparing" progress line. The display thread only exists
+    # when NOT -q, so each case here is deliberately run WITHOUT -q (with -q
+    # there is no thread and the bug is invisible -- which is how it survived
+    # the first e2e sweep). Run-Cli's 120s watchdog turns a regression into a
+    # failure instead of a wedged suite.
+    Write-Output 'test 22b: pre-flight rejections exit 2 without hanging (no -q)'
+    $unenc = Join-Path $tmp 'unenc.7z'
+    & $sz a $unenc (Join-Path $tmp 'payload.txt') | Out-Null
+    $d22b = Write-Dict 'd22b.txt' @('x')
+    $cMissing = Run-Cli crack -a (Join-Path $tmp 'nope.7z') -w $d22b -t 1
+    $cDir = Run-Cli crack -a $noDir -w $d22b -t 1
+    $cUnenc = Run-Cli crack -a $unenc -w $d22b -t 1
+    $cProg = Run-Cli crack -a $unenc -w $d22b -t 1 --progress
+    if ($cMissing -eq 2 -and $cDir -eq 2 -and $cUnenc -eq 2 -and $cProg -eq 2) { Pass 'test 22b' }
+    else {
+        Fail 'test 22b' ("missing=" + $cMissing + " dir=" + $cDir + " unenc=" + $cUnenc +
+            " progress=" + $cProg + " (-999 = watchdog timeout)")
+    }
 
     # ---- test 23: open_error parity -- locked (unreadable) file -------
     # a file held open with FileShare.None must hit the readable-error

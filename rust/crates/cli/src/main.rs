@@ -34,7 +34,7 @@ enum Commands {
         #[arg(long)]
         hashcat: bool,
     },
-    /// 基准测速（需要 RAR5 或加密 ZIP）
+    /// 基准测速（需要可原生校验的格式：RAR5 / RAR 4.x / 7z 快路径 / 加密 ZIP）
     Bench {
         #[arg(short = 'a', long)]
         archive: String,
@@ -167,7 +167,30 @@ fn cmd_info(archive_path: &str, hashcat: bool) -> i32 {
                 }
             }
         }
-        ArchiveKind::RarLegacy => outln!("格式: RAR 1.5-4.x"),
+        ArchiveKind::RarLegacy => {
+            outln!("格式: RAR 1.5-4.x");
+            match &info.rar4 {
+                None => outln!("加密: 未检测到可用的原生校验数据"),
+                Some(r) => {
+                    if r.header_encrypted {
+                        outln!("加密方式: -hp 头加密（ENDARC 块校验）");
+                    } else {
+                        outln!("加密方式: -p 数据加密");
+                        if let Some(n) = &r.entry_name {
+                            outln!("目标条目: {}", n);
+                        }
+                        outln!(
+                            "压缩方法: {}",
+                            if r.method == 0x30 {
+                                "存储 (0x30)".to_string()
+                            } else {
+                                format!("压缩 (0x{:02x})", r.method)
+                            }
+                        );
+                    }
+                }
+            }
+        }
         ArchiveKind::Zip => {
             outln!("格式: ZIP");
             match &info.zip {
@@ -184,6 +207,12 @@ fn cmd_info(archive_path: &str, hashcat: bool) -> i32 {
         ArchiveKind::SevenZip => outln!("格式: 7z"),
         ArchiveKind::Unknown => outln!("格式: 无法识别（{}）", info.detect_note),
     }
+    // why an archive fell back to the external tool (7z containers that need
+    // a decompressor, unsupported variants, ...) is the first thing to check
+    // when a format did not take the native path
+    if !info.detect_note.is_empty() {
+        outln!("说明: {}", info.detect_note);
+    }
     outln!("验证路径: {}", if info.native_supported() { "原生引擎 (native)" } else { "外部工具 (external)" });
     0
 }
@@ -199,7 +228,7 @@ fn cmd_bench(archive_path: &str, threads: u32, seconds: u32) -> i32 {
         return 2;
     }
     if !info.native_supported() {
-        errln!("该压缩包不支持原生验证（{}），基准测速需要 RAR5 或加密 ZIP。", info.detect_note);
+        errln!("该压缩包不支持原生验证（{}），基准测速需要可原生校验的格式（RAR5 / RAR 4.x / 7z 快路径 / 加密 ZIP）。", info.detect_note);
         return 2;
     }
     let v: Arc<dyn verifier::Verifier + Send + Sync> = match verifier::create_native(&info, archive_path) {
@@ -435,6 +464,7 @@ fn cmd_crack(
             let mut prev_tried = 0i64;
             let mut prev_time = Instant::now();
             let mut rate = 0.0f64;
+            let mut tick = 0usize;
             loop {
                 let tried = stats2.tried.load(Ordering::Relaxed) + stats2.base_tried.load(Ordering::Relaxed);
                 let now = Instant::now();
@@ -448,8 +478,8 @@ fn cmd_crack(
                     prev_time = now;
                 }
                 let phase = stats2.phase.lock().unwrap().clone();
-                let cur = stats2.current.lock().unwrap().clone();
-                let tag = stats2.current_tag.lock().unwrap().clone();
+                let (cur, tag) = stats2.current_sample(tick);
+                tick += 1;
                 let total = stats2.total.load(Ordering::Relaxed);
                 outln!("{}", progress_stats_json(&phase, tried, total, &tag, &cur, rate));
                 if stats2.done.load(Ordering::Relaxed) {
@@ -465,6 +495,7 @@ fn cmd_crack(
             let mut prev_tried = 0i64;
             let mut prev_time = Instant::now();
             let mut rate = 0.0f64;
+            let mut tick = 0usize;
             while !stats.done.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(500));
                 let tried = stats.tried.load(Ordering::Relaxed) + stats.base_tried.load(Ordering::Relaxed);
@@ -487,8 +518,8 @@ fn cmd_crack(
                     }
                 }
                 let phase = stats.phase.lock().unwrap().clone();
-                let cur = stats.current.lock().unwrap().clone();
-                let tag = stats.current_tag.lock().unwrap().clone();
+                let (cur, tag) = stats.current_sample(tick);
+                tick += 1;
                 let cur = if !tag.is_empty() { format!("[{}] {}", tag, cur) } else { cur };
                 let mut line = format!(
                     "{} | 已试 {}{} | {:.1} 个/秒{} | 当前: {}",

@@ -83,20 +83,23 @@ pub struct EngineStats {
     pub base_tried: AtomicI64,
     pub total: AtomicI64, // -1 = unknown
     pub phase: Mutex<String>,
-    pub current: Mutex<String>,
-    pub current_tag: Mutex<String>,
+    /// one "current candidate" slot per worker: worker w writes only slot
+    /// w, display readers sample a slot per refresh. The old shared
+    /// Mutex<String> pair was locked twice per candidate by every worker
+    /// and collapsed throughput at high thread counts (cache-line ping-pong
+    /// plus a String alloc/free per candidate).
+    pub worker_current: Vec<Mutex<(String, String)>>,
     pub done: AtomicBool,
 }
 
 impl EngineStats {
-    pub fn new() -> Self {
+    pub fn new(workers: usize) -> Self {
         EngineStats {
             tried: AtomicI64::new(0),
             base_tried: AtomicI64::new(0),
             total: AtomicI64::new(-1),
             phase: Mutex::new("准备中".into()),
-            current: Mutex::new(String::new()),
-            current_tag: Mutex::new(String::new()),
+            worker_current: (0..workers.max(1)).map(|_| Mutex::new((String::new(), String::new()))).collect(),
             done: AtomicBool::new(false),
         }
     }
@@ -105,6 +108,22 @@ impl EngineStats {
     }
     pub fn reached(&self, n: i64) -> bool {
         self.tried.load(Ordering::Relaxed) >= n
+    }
+    /// Record a worker's current candidate into its own slot (index wraps
+    /// against the slot count). Only ever contended with display readers.
+    pub fn note_current(&self, worker: usize, pw: &str, tag: &str) {
+        let n = self.worker_current.len();
+        let mut s = self.worker_current[worker % n].lock().unwrap();
+        let (ref mut cur, ref mut cur_tag) = *s;
+        cur.clear();
+        cur.push_str(pw);
+        cur_tag.clear();
+        cur_tag.push_str(tag);
+    }
+    /// (password, tag) from one worker's slot, cycling across workers so
+    /// successive display refreshes sample different workers.
+    pub fn current_sample(&self, tick: usize) -> (String, String) {
+        self.worker_current[tick % self.worker_current.len()].lock().unwrap().clone()
     }
 }
 
@@ -184,6 +203,21 @@ fn count_mask_tokens(mask: &str) -> usize {
     n.max(1)
 }
 
+/// Producer batching shape for `threads` workers: (candidates per batch,
+/// channel capacity in batches). The resume margin an engine rewinds by is
+/// threads*8+threads+16 candidates, so everything that can still be
+/// unverified at checkpoint time -- `cap` queued batches plus one batch
+/// held by each worker -- must fit inside that window, or a session handed
+/// to a resume with different --threads (including the C# build, which
+/// shares session.json) would permanently skip candidates. Larger batches
+/// would amortize the channel further but cannot fit the margin.
+fn batch_shape(threads: u32) -> (usize, usize) {
+    let batch = 8usize;
+    // (cap + threads) * batch <= threads*8 + threads + 16  =>  cap <= (threads+16)/8
+    let cap = ((threads as usize) + 16) / 8;
+    (batch, cap.max(1))
+}
+
 pub struct CrackEngine {
     cfg: CrackConfig,
     pub stats: Arc<EngineStats>,
@@ -192,7 +226,12 @@ pub struct CrackEngine {
 
 impl CrackEngine {
     pub fn new(cfg: CrackConfig) -> Self {
-        CrackEngine { cfg, stats: Arc::new(EngineStats::new()), log_note: Arc::new(Mutex::new(String::new())) }
+        let workers = if cfg.threads == 0 {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        } else {
+            cfg.threads as usize
+        };
+        CrackEngine { cfg, stats: Arc::new(EngineStats::new(workers)), log_note: Arc::new(Mutex::new(String::new())) }
     }
 
     fn build_source(&self) -> Result<Box<dyn CandidateSource + Send>, String> {
@@ -237,7 +276,19 @@ impl CrackEngine {
 
     /// Runs a full crack attempt. Never panics for per-candidate errors.
     /// `external` is the Ctrl+C cancel flag.
+    ///
+    /// Every exit path must publish `stats.done`, or a display thread
+    /// spinning on it (`while !stats.done { .. }`) never terminates -- the
+    /// pre-flight rejections below used to return early and leave the
+    /// non-quiet progress thread printing "准备中" forever. The flag is set
+    /// here, on the single funnel, instead of at each return.
     pub fn run(&self, external: Arc<AtomicBool>) -> CrackResult {
+        let res = self.run_inner(external);
+        self.stats.done.store(true, Ordering::Relaxed);
+        res
+    }
+
+    fn run_inner(&self, external: Arc<AtomicBool>) -> CrackResult {
         let mut res = CrackResult::default();
         let sw = Instant::now();
         let archive = std::fs::canonicalize(&self.cfg.archive_path)
@@ -370,8 +421,11 @@ impl CrackEngine {
             }
         }
 
-        // producer/consumer via a bounded channel (capacity threads*8)
-        let (tx, rx) = crossbeam_channel::bounded::<crate::attacks::Candidate>((threads * 8) as usize);
+        // producer/consumer via a bounded channel of candidate batches
+        // (batch shape keeps queued + worker-held candidates inside the
+        // resume margin, see batch_shape)
+        let (_, cap_batches) = batch_shape(threads);
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<crate::attacks::Candidate>>(cap_batches);
         let cancel = Arc::new(AtomicBool::new(false));
         let hit_password = Arc::new(Mutex::new(Option::<String>::None));
         let producer_error = Arc::new(Mutex::new(Option::<String>::None));
@@ -411,13 +465,42 @@ impl CrackEngine {
         let plan_note_prod = plan_note.clone();
         let producer = std::thread::spawn(move || {
             let mut local_pos = live_pos_prod.lock().unwrap().clone();
-            // the emit closure writes the live position before each send; to
-            // avoid a borrow conflict we keep local_pos outside the closure
-            // and pass both in explicitly.
+            let (batch_size, _) = batch_shape(threads);
+            let mut batch: Vec<crate::attacks::Candidate> = Vec::with_capacity(batch_size);
+            // position of the last candidate currently sitting in `batch`
+            let mut batch_end = local_pos.clone();
+            // the resume margin rewinds line_idx / counter / idx_b but never
+            // file_idx / mask length / combinator A line, so a batch must
+            // not span a change of those or the rewind would land in the
+            // wrong region and skip candidates
+            let mut coarse = (local_pos.file_idx, local_pos.seg, local_pos.idx_a);
             {
                 let live_pos_prod = &live_pos_prod;
                 let tx = &tx;
-                let mut emit = move |mut cand: crate::attacks::Candidate, pos: &SourcePosition| {
+                // send the filled batch, then advance live_pos to its end
+                // (only sent data is claimed); false = run is over
+                let flush = |batch: &mut Vec<crate::attacks::Candidate>, end: &SourcePosition| -> bool {
+                    if batch.is_empty() {
+                        return true;
+                    }
+                    let mut sent = std::mem::take(batch);
+                    loop {
+                        match tx.send_timeout(sent, Duration::from_millis(100)) {
+                            Ok(()) => {
+                                *live_pos_prod.lock().unwrap() = end.clone();
+                                return true;
+                            }
+                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return false,
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(pending)) => {
+                                sent = pending;
+                                if cancel_emit.load(Ordering::Relaxed) || external_emit.load(Ordering::Relaxed) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                };
+                let mut emit = |cand: crate::attacks::Candidate, pos: &SourcePosition| {
                     // stop feeding once a hit / max-tries / Ctrl+C cancelled
                     // the run: the workers have gone away and a blocking send
                     // into the bounded queue would deadlock the join. The
@@ -425,31 +508,26 @@ impl CrackEngine {
                     if cancel_emit.load(Ordering::Relaxed) || external_emit.load(Ordering::Relaxed) {
                         return;
                     }
-                    *live_pos_prod.lock().unwrap() = pos.clone();
-                    // bounded send with a cancel-aware retry loop: workers
-                    // can be wedged past the timeout (e.g. a slow spawn
-                    // verifier), and a candidate dropped here is also skipped
-                    // by --resume (live_pos already advanced past it), so
-                    // retry until it is delivered or the run is over. A bare
-                    // send() would re-introduce the M3 deadlock: a cancel
-                    // arriving after the consumers exited would block the
-                    // producer forever.
-                    loop {
-                        match tx.send_timeout(cand, Duration::from_millis(100)) {
-                            Ok(()) => break,
-                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return,
-                            Err(crossbeam_channel::SendTimeoutError::Timeout(pending)) => {
-                                cand = pending;
-                                if cancel_emit.load(Ordering::Relaxed) || external_emit.load(Ordering::Relaxed) {
-                                    return;
-                                }
-                            }
+                    let coarse_now = (pos.file_idx, pos.seg, pos.idx_a);
+                    if batch.len() >= batch_size || coarse_now != coarse {
+                        if !flush(&mut batch, &batch_end) {
+                            return;
                         }
+                        coarse = coarse_now;
                     }
+                    batch_end = pos.clone();
+                    batch.push(cand);
                 };
                 source.enumerate_with_pos(&mut local_pos, &cancel_prod, &mut emit);
+                drop(emit);
+                // deliver the trailing partial batch so nothing enumerated
+                // is lost; live_pos then ends on the last candidate, not on
+                // the past-the-end position
+                if !cancel_emit.load(Ordering::Relaxed) && !external_emit.load(Ordering::Relaxed) {
+                    flush(&mut batch, &batch_end);
+                }
             }
-            *live_pos_prod.lock().unwrap() = local_pos;
+            batch.clear();
             if let Some(n) = source.plan_note() {
                 *plan_note_prod.lock().unwrap() = Some(n);
             }
@@ -462,7 +540,7 @@ impl CrackEngine {
         let worker_error = Arc::new(Mutex::new(Option::<String>::None));
         let v: Arc<dyn Verifier + Send + Sync> = verifier_obj.into();
         let mut workers = Vec::new();
-        for _ in 0..threads {
+        for w in 0..threads {
             let rx = rx.clone();
             let v = v.clone();
             let stats = self.stats.clone();
@@ -472,37 +550,56 @@ impl CrackEngine {
             let maxed = maxed_out.clone();
             let werr = worker_error.clone();
             workers.push(std::thread::spawn(move || {
-                for cand in rx.iter() {
-                    if (cancel.load(Ordering::Relaxed) || external.load(Ordering::Relaxed))
-                        && hit.lock().unwrap().is_some()
-                    {
-                        return;
+                let slot = w as usize;
+                // candidates are verified in groups of 4 (the RAR5
+                // multi-buffer kernel size); counting, hit recording and
+                // the cancel/max-tries checks stay per candidate, in
+                // candidate order -- only the verification work itself is
+                // batched, so cancellation latency grows by at most one
+                // group (RAR5: ~10 ms)
+                const GROUP: usize = 4;
+                for batch in rx.iter() {
+                    if let Some(first) = batch.first() {
+                        stats.note_current(slot, &first.pw, &first.tag);
                     }
-                    *stats.current.lock().unwrap() = cand.pw.clone();
-                    *stats.current_tag.lock().unwrap() = cand.tag.clone();
-                    stats.add_tried();
-                    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| v.verify(&cand.pw)))
+                    for group in batch.chunks(GROUP) {
+                        if (cancel.load(Ordering::Relaxed) || external.load(Ordering::Relaxed))
+                            && hit.lock().unwrap().is_some()
+                        {
+                            return;
+                        }
+                        let mut pws: [&str; GROUP] = [""; GROUP];
+                        for (i, cand) in group.iter().enumerate() {
+                            pws[i] = &cand.pw;
+                        }
+                        let hit_idx = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            v.verify_batch(&pws[..group.len()])
+                        }))
                         .unwrap_or_else(|_| {
                             *werr.lock().unwrap() = Some("verify panicked".into());
-                            false
+                            None
                         });
-                    if ok {
-                        {
-                            let mut h = hit.lock().unwrap();
-                            if h.is_none() {
-                                *h = Some(cand.pw.clone());
+                        for (i, cand) in group.iter().enumerate() {
+                            stats.add_tried();
+                            if hit_idx == Some(i) {
+                                {
+                                    let mut h = hit.lock().unwrap();
+                                    if h.is_none() {
+                                        *h = Some(cand.pw.clone());
+                                    }
+                                }
+                                cancel.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            if max_tries > 0 && stats.reached(max_tries) {
+                                maxed.store(true, Ordering::Relaxed);
+                                cancel.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            if external.load(Ordering::Relaxed) {
+                                return;
                             }
                         }
-                        cancel.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    if max_tries > 0 && stats.reached(max_tries) {
-                        maxed.store(true, Ordering::Relaxed);
-                        cancel.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    if external.load(Ordering::Relaxed) {
-                        return;
                     }
                 }
             }));
@@ -708,13 +805,20 @@ pub fn bench_measure(
         handles.push(std::thread::spawn(move || {
             let mut mine: u64 = 0;
             let mut seed: u64 = (t as u64).wrapping_mul(7919).wrapping_add(13);
+            // drive the verifier through 4-candidate groups, the same
+            // shape the crack workers use (multi-buffer kernels only pay
+            // off on full groups)
+            let mut pwds: [String; 4] = Default::default();
             while start.elapsed() < deadline {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                let pwd = format!("{:016x}", seed);
-                let _ = v.verify(&pwd);
-                mine += 1;
+                for p in pwds.iter_mut() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    *p = format!("{:016x}", seed);
+                }
+                let refs: [&str; 4] = [&pwds[0], &pwds[1], &pwds[2], &pwds[3]];
+                let _ = v.verify_batch(&refs);
+                mine += 4;
             }
             total.fetch_add(mine, Ordering::Relaxed);
         }));
@@ -730,6 +834,41 @@ pub fn bench_measure(
 mod tests {
     use super::*;
     use crate::session::SessionState;
+
+    #[test]
+    fn batch_shape_keeps_inflight_within_resume_margin() {
+        // A session saved by this build must be resumable by an engine that
+        // rewinds by exactly threads*8+threads+16 candidates (the C# build,
+        // or this build with a different -t). Everything that can still be
+        // unverified at checkpoint time -- `cap` queued batches plus one
+        // batch held by each worker -- has to fit inside that window, or a
+        // resume would permanently skip candidates.
+        for t in 1..=64u32 {
+            let (batch, cap) = batch_shape(t);
+            assert!(batch >= 1 && cap >= 1, "t={}: degenerate shape ({}, {})", t, batch, cap);
+            let inflight = (cap as i64 + t as i64) * batch as i64;
+            let margin = (t as i64) * 8 + t as i64 + 16;
+            assert!(inflight <= margin, "t={}: in-flight {} > margin {}", t, inflight, margin);
+        }
+    }
+
+    #[test]
+    fn worker_current_slots_are_per_worker_and_cycled() {
+        let st = EngineStats::new(3);
+        st.note_current(0, "aaa", "t1");
+        st.note_current(2, "bbb", "");
+        let (pw, tag) = st.current_sample(0);
+        assert_eq!(pw, "aaa");
+        assert_eq!(tag, "t1");
+        let (pw, tag) = st.current_sample(2);
+        assert_eq!(pw, "bbb");
+        assert_eq!(tag, "");
+        // worker index above the slot count wraps instead of panicking
+        st.note_current(3, "ccc", "t3");
+        let (pw, tag) = st.current_sample(0);
+        assert_eq!(pw, "ccc");
+        assert_eq!(tag, "t3");
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("dceng-{}-{}", tag, std::process::id()));
@@ -804,5 +943,53 @@ mod tests {
         assert_eq!(s.len(), 8, "HH:mm:ss shape");
         assert_eq!(&s[2..3], ":", "colon at 2");
         assert_eq!(&s[5..6], ":", "colon at 5");
+    }
+
+    /// Every `run` exit path must publish `stats.done`, or a display thread
+    /// looping on it never terminates: `main.rs` prints with
+    /// `while !stats.done { .. }` and then joins that thread unconditionally,
+    /// so a missed store hangs the whole CLI (observed on an unencrypted
+    /// archive, which takes the "no password protection" early return).
+    /// This pins the flag on the error paths that return before the worker
+    /// loop is even built.
+    #[test]
+    fn run_publishes_done_on_every_early_exit() {
+        let dir = temp_dir("done-flag");
+        let dict = dir.join("d.txt");
+        std::fs::write(&dict, "a\nb\n").unwrap();
+
+        // path 1: missing archive
+        let cfg = CrackConfig {
+            archive_path: dir.join("nope.7z").display().to_string(),
+            dict_files: vec![dict.display().to_string()],
+            threads: 1,
+            ..Default::default()
+        };
+        let eng = CrackEngine::new(cfg);
+        let stats = eng.stats.clone();
+        let res = eng.run(Arc::new(AtomicBool::new(false)));
+        assert!(res.error.is_some(), "missing archive must error");
+        assert!(stats.done.load(Ordering::Relaxed), "missing archive left done unset");
+
+        // path 2: a RAR5 signature with no crypt record: `info.rar5` is None
+        // and the run is rejected before any worker or the producer exists.
+        // (Using a plain non-archive file would NOT exercise this: it falls
+        // through to the spawn verifier and the dictionary, so it reaches
+        // the normal exit path that already stored the flag.)
+        let rar5 = dir.join("empty5.rar");
+        std::fs::write(&rar5, [0x52u8, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]).unwrap();
+        let cfg = CrackConfig {
+            archive_path: rar5.display().to_string(),
+            dict_files: vec![dict.display().to_string()],
+            threads: 1,
+            ..Default::default()
+        };
+        let eng = CrackEngine::new(cfg);
+        let stats = eng.stats.clone();
+        let res = eng.run(Arc::new(AtomicBool::new(false)));
+        assert!(res.error.is_some(), "RAR5 without check data must error");
+        assert!(stats.done.load(Ordering::Relaxed), "pre-flight rejection left done unset");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
